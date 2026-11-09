@@ -4,6 +4,7 @@ import (
 	"FinanceSimulator/datasource"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -82,8 +83,12 @@ func TestParquetRead(t *testing.T) {
 	}
 
 	validFile := filepath.Join(temporaryDirectory, "data.parquet")
-	if err := ParquetRead(validFile); err != nil {
-		t.Errorf("ParquetRead valid file: %v", err)
+	readBars, err := ParquetRead(validFile)
+	if err != nil {
+		t.Fatalf("ParquetRead valid file: %v", err)
+	}
+	if !reflect.DeepEqual(readBars, barsList) {
+		t.Errorf("ParquetRead bars = %#v, want %#v", readBars, barsList)
 	}
 
 	invalidFile := filepath.Join(temporaryDirectory, "invalid.parquet")
@@ -91,6 +96,7 @@ func TestParquetRead(t *testing.T) {
 		t.Fatalf("write invalid fixture: %v", err)
 	}
 
+	var readBarsFromInvalidFile [][]datasource.Bar
 	var readErr error
 	func() {
 		defer func() {
@@ -98,9 +104,12 @@ func TestParquetRead(t *testing.T) {
 				t.Fatalf("ParquetRead invalid file panicked: %v", recovered)
 			}
 		}()
-		readErr = ParquetRead(invalidFile)
+		readBarsFromInvalidFile, readErr = ParquetRead(invalidFile)
 	}()
 	if readErr == nil {
 		t.Error("ParquetRead invalid file error = nil, want a read error")
+	}
+	if readBarsFromInvalidFile != nil {
+		t.Errorf("ParquetRead invalid file bars = %#v, want nil", readBarsFromInvalidFile)
 	}
 }

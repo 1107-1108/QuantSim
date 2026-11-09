@@ -16,7 +16,7 @@ func TestYahooApiMaker(t *testing.T) {
 		// Arrange
 		want := "https://query1.finance.yahoo.com/v8/finance/chart/AAPL" +
 			"?period1=1704153600&period2=1704844800" +
-			"&interval=1d&events=history&includeAdjustedClose=true"
+			"&interval=1d&events=div,split&includeAdjustedClose=true"
 
 		// Act
 		got, err := YahooApiMaker("AAPL", "2024-01-02", "2024-01-10", "true", "1d")
@@ -84,7 +84,7 @@ func TestYahooApiMaker(t *testing.T) {
 			"period1":              "1704153600",
 			"period2":              "1704844800",
 			"interval":             "1d",
-			"events":               "history",
+			"events":               "div,split",
 			"includeAdjustedClose": "true",
 		}
 		query := parsed.Query()

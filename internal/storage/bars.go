@@ -16,6 +16,7 @@ type Record struct {
 	Symbol string               `parquet:"symbol, zstd"`
 }
 
+// ParquetWrite 将相同索引的 bars、timeframe 和 symbol 组成一条 record 写入 data.parquet。
 func ParquetWrite(bars [][]datasource.Bar, tf []datasource.Timeframe, symbol []string) error {
 	var recordList []Record
 	for i := range bars {
@@ -44,20 +45,21 @@ func ParquetWrite(bars [][]datasource.Bar, tf []datasource.Timeframe, symbol []s
 	return nil
 }
 
-func ParquetRead(filename string) error {
+// ParquetRead 从 filename 读取所有 record，并按写入时的 record 边界返回 bars。
+func ParquetRead(filename string) ([][]datasource.Bar, error) {
 	rf, err := os.Open(filename)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rf.Close()
 
 	fileInfo, err := rf.Stat()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	parquetFile, err := parquet.OpenFile(rf, fileInfo.Size())
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	pf := parquet.NewReader(parquetFile)
@@ -69,9 +71,13 @@ func ParquetRead(filename string) error {
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		recordList = append(recordList, record)
 	}
-	return nil
+	result := make([][]datasource.Bar, 0, len(recordList))
+	for _, record := range recordList {
+		result = append(result, record.Bars)
+	}
+	return result, nil
 }
