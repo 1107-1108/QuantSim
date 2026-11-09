@@ -6,6 +6,8 @@ FinanceSimulator lets you develop Python trading strategies, validate them with 
 
 The project is designed for private, local use: strategy code, market data, backtest parameters and trading records remain on your own machine.
 
+Thanks a lot for Ashley's Mental and Coffee Support!
+
 ## Why Quant Simulator?
 
 - Keep your strategy code and research data local
