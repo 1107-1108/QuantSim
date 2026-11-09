@@ -1,7 +1,11 @@
 package portfolio
 
 import (
+	"math/rand"
+	"reflect"
 	"testing"
+
+	"FinanceSimulator/datasource"
 )
 
 // 手工脚本序列:买 → 买 → 部分卖出,逐笔累积账本,最后跑守恒校验
@@ -26,6 +30,110 @@ func TestVerifyConservationAfterTradeSequence(t *testing.T) {
 	// Assert:现金 + 成本基础 = 初始现金 + 已实现
 	if err := VerifyConservation(30_000, account, entries); err != nil {
 		t.Errorf("VerifyConservation: %v", err)
+	}
+}
+
+// TestVerifyConservationAcrossRandomEventSequences 用固定随机序列验证混合事件后的守恒与不可变性。
+func TestVerifyConservationAcrossRandomEventSequences(t *testing.T) {
+	const initialCash = 10_000.0
+	account, _ := NewAccount(initialCash)
+	entries := []LedgerEntry(nil)
+	random := rand.New(rand.NewSource(42))
+	sequence := uint64(1)
+
+	for step := 0; step < 100; step++ {
+		before := snapshotAccount(account)
+		source := account
+		eventTime := testTime1.AddDate(0, 0, step)
+
+		switch random.Intn(4) {
+		case 0:
+			price := float64(random.Intn(20) + 1)
+			qty := float64(random.Intn(5) + 1)
+			if price*qty > source.Cash() {
+				continue
+			}
+			next, newEntries, err := ApplyFill(source, Fill{Seq: sequence, Symbol: "AAPL", Side: SideBuy, Qty: qty, Price: price, Time: eventTime})
+			if err != nil {
+				t.Fatalf("step %d buy: %v", step, err)
+			}
+			sequence++
+			account, entries = next, append(entries, newEntries...)
+		case 1:
+			held := source.PositionQty("AAPL")
+			if held == 0 {
+				continue
+			}
+			qty := held * float64(random.Intn(100)+1) / 100
+			price := float64(random.Intn(20) + 1)
+			next, newEntries, err := ApplyFill(source, Fill{Seq: sequence, Symbol: "AAPL", Side: SideSell, Qty: qty, Price: price, Time: eventTime})
+			if err != nil {
+				t.Fatalf("step %d sell: %v", step, err)
+			}
+			sequence++
+			account, entries = next, append(entries, newEntries...)
+		case 2:
+			action := datasource.CorporateAction{Symbol: "AAPL", Type: datasource.ActionSplit, SplitRatio: 2, Date: eventTime}
+			if random.Intn(2) == 0 {
+				action.Type = datasource.ActionReverseSplit
+				action.SplitRatio = 0.5
+			}
+			next, newEntries, err := ApplyCorporateAction(source, action)
+			if err != nil {
+				t.Fatalf("step %d split: %v", step, err)
+			}
+			account, entries = next, append(entries, newEntries...)
+		case 3:
+			next, newEntries, err := ApplyCorporateAction(source, datasource.CorporateAction{
+				Symbol:       "AAPL",
+				Type:         datasource.ActionDividend,
+				CashPerShare: 0.1,
+				Date:         eventTime,
+			})
+			if err != nil {
+				t.Fatalf("step %d dividend: %v", step, err)
+			}
+			account, entries = next, append(entries, newEntries...)
+		}
+
+		if !reflect.DeepEqual(before, source) {
+			t.Fatalf("step %d changed the source account", step)
+		}
+		if err := VerifyConservation(initialCash, account, entries); err != nil {
+			t.Fatalf("step %d conservation: %v", step, err)
+		}
+	}
+}
+
+// TestVerifyConservationAfterMixedEvents 验证成交、拆股和分红混合后守恒关系仍成立。
+func TestVerifyConservationAfterMixedEvents(t *testing.T) {
+	account, _ := NewAccount(5_000)
+	var entries []LedgerEntry
+
+	applyFill := func(fill Fill) {
+		next, newEntries, err := ApplyFill(account, fill)
+		if err != nil {
+			t.Fatalf("ApplyFill(%+v): %v", fill, err)
+		}
+		account = next
+		entries = append(entries, newEntries...)
+	}
+	applyAction := func(action datasource.CorporateAction) {
+		next, newEntries, err := ApplyCorporateAction(account, action)
+		if err != nil {
+			t.Fatalf("ApplyCorporateAction(%+v): %v", action, err)
+		}
+		account = next
+		entries = append(entries, newEntries...)
+	}
+
+	applyFill(Fill{Seq: 1, Symbol: "AAPL", Side: SideBuy, Qty: 100, Price: 10, Time: testTime1})
+	applyAction(datasource.CorporateAction{Symbol: "AAPL", Type: datasource.ActionSplit, SplitRatio: 2, Date: testTime2})
+	applyAction(datasource.CorporateAction{Symbol: "AAPL", Type: datasource.ActionDividend, CashPerShare: 0.5, Date: testTime2})
+	applyFill(Fill{Seq: 2, Symbol: "AAPL", Side: SideSell, Qty: 200, Price: 6, Time: testTime2})
+
+	if err := VerifyConservation(5_000, account, entries); err != nil {
+		t.Errorf("VerifyConservation after mixed events: %v", err)
 	}
 }
 

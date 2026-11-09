@@ -20,7 +20,7 @@ func snapshotAccount(a Account) Account {
 	c := Account{
 		initialCash: a.initialCash,
 		cash:        a.cash,
-		positions:   make(map[InstrumentID][]Lot, len(a.positions)),
+		positions:   make(map[string][]Lot, len(a.positions)),
 	}
 	for symbol, lots := range a.positions {
 		c.positions[symbol] = slices.Clone(lots)
@@ -63,6 +63,88 @@ func TestApplyFillRejectsInvalidFills(t *testing.T) {
 	}
 }
 
+// TestApplyFillRejectsInfiniteFinancialValues 防止无穷大金额破坏现金和成本基础。
+func TestApplyFillRejectsInfiniteFinancialValues(t *testing.T) {
+	valid := Fill{Seq: 1, Symbol: "AAPL", Side: SideBuy, Qty: 10, Price: 100, Commission: 1, Time: testTime1}
+	cases := []struct {
+		name   string
+		mutate func(*Fill)
+	}{
+		{"无穷数量", func(f *Fill) { f.Qty = math.Inf(1) }},
+		{"无穷价格", func(f *Fill) { f.Price = math.Inf(1) }},
+		{"无穷佣金", func(f *Fill) { f.Commission = math.Inf(1) }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			account, err := NewAccount(2_000)
+			if err != nil {
+				t.Fatalf("NewAccount: %v", err)
+			}
+			before := snapshotAccount(account)
+			fill := valid
+			tc.mutate(&fill)
+
+			next, entries, err := ApplyFill(account, fill)
+
+			if !errors.Is(err, ErrInvalidFill) {
+				t.Errorf("err = %v, want ErrInvalidFill", err)
+			}
+			if entries != nil {
+				t.Errorf("entries = %v, want nil", entries)
+			}
+			if !reflect.DeepEqual(next, before) || !reflect.DeepEqual(account, before) {
+				t.Error("invalid fill changed the input or returned account")
+			}
+		})
+	}
+}
+
+// TestApplyFillUsesSequenceForFIFOTies 验证相同时间的 lot 仍按全局成交序号先进先出。
+func TestApplyFillUsesSequenceForFIFOTies(t *testing.T) {
+	account, _ := NewAccount(10_000)
+	openedAt := testTime1
+	first, _, err := ApplyFill(account, Fill{Seq: 10, Symbol: "AAPL", Side: SideBuy, Qty: 10, Price: 10, Time: openedAt})
+	if err != nil {
+		t.Fatalf("first buy: %v", err)
+	}
+	second, _, err := ApplyFill(first, Fill{Seq: 11, Symbol: "AAPL", Side: SideBuy, Qty: 10, Price: 20, Time: openedAt})
+	if err != nil {
+		t.Fatalf("second buy: %v", err)
+	}
+
+	_, entries, err := ApplyFill(second, Fill{Seq: 12, Symbol: "AAPL", Side: SideSell, Qty: 10, Price: 30, Time: testTime2})
+
+	if err != nil {
+		t.Fatalf("sell: %v", err)
+	}
+	if len(entries) < 1 || entries[0].LotOpenSeq != 10 {
+		t.Errorf("first realized lot sequence = %d, want 10", entries[0].LotOpenSeq)
+	}
+}
+
+// TestApplyFillOrdersLotsByOpenTime 验证乱序补发的成交也按建仓时间维持 FIFO 队列。
+func TestApplyFillOrdersLotsByOpenTime(t *testing.T) {
+	account, _ := NewAccount(10_000)
+	later, _, err := ApplyFill(account, Fill{Seq: 1, Symbol: "AAPL", Side: SideBuy, Qty: 10, Price: 20, Time: testTime2})
+	if err != nil {
+		t.Fatalf("later buy: %v", err)
+	}
+	earlier, _, err := ApplyFill(later, Fill{Seq: 2, Symbol: "AAPL", Side: SideBuy, Qty: 10, Price: 10, Time: testTime1})
+	if err != nil {
+		t.Fatalf("earlier buy: %v", err)
+	}
+
+	_, entries, err := ApplyFill(earlier, Fill{Seq: 3, Symbol: "AAPL", Side: SideSell, Qty: 10, Price: 30, Time: testTime2})
+
+	if err != nil {
+		t.Fatalf("sell: %v", err)
+	}
+	if len(entries) < 1 || entries[0].LotOpenSeq != 2 {
+		t.Errorf("first realized lot sequence = %d, want 2 (the earlier open time)", entries[0].LotOpenSeq)
+	}
+}
+
 func TestApplyFillBuyAddsLotWithCommissionInCost(t *testing.T) {
 	// Arrange:现金 11000,买 100 股 @100、佣金 1 → 总成本 10001,每股成本 100.01
 	account, _ := NewAccount(11_000)
@@ -92,11 +174,11 @@ func TestApplyFillBuyAddsLotWithCommissionInCost(t *testing.T) {
 		t.Fatalf("len(lots) = %d, want 1", len(lots))
 	}
 	lot := lots[0]
-	if lot.RemainQty != 100 || lot.openSeq != 7 || !lot.openTime.Equal(testTime1) {
-		t.Errorf("lot = %+v, want {Qty 100, openSeq 7, openTime %v}", lot, testTime1)
+	if lot.Qty != 100 || lot.OpenSeq != 7 || !lot.OpenTime.Equal(testTime1) {
+		t.Errorf("lot = %+v, want {Qty 100, OpenSeq 7, OpenTime %v}", lot, testTime1)
 	}
-	if !almostEqual(lot.costPerShare, 100.01) {
-		t.Errorf("costPerShare = %v, want 100.01(佣金已摊入)", lot.costPerShare)
+	if !almostEqual(lot.CostPerShare, 100.01) {
+		t.Errorf("CostPerShare = %v, want 100.01(佣金已摊入)", lot.CostPerShare)
 	}
 
 	// Assert:一条 TRADE 条目
@@ -211,10 +293,10 @@ func TestApplyFillSellPartialKeepsRemainingLot(t *testing.T) {
 	if len(lots) != 1 {
 		t.Fatalf("len(lots) = %d, want 1", len(lots))
 	}
-	if lots[0].RemainQty != 40 {
-		t.Errorf("剩余数量 = %v, want 40", lots[0].RemainQty)
+	if lots[0].Qty != 40 {
+		t.Errorf("剩余数量 = %v, want 40", lots[0].Qty)
 	}
-	if !almostEqual(lots[0].costPerShare, 100.01) || lots[0].openSeq != 5 {
+	if !almostEqual(lots[0].CostPerShare, 100.01) || lots[0].OpenSeq != 5 {
 		t.Errorf("剩余 lot = %+v, 成本或序号被改动", lots[0])
 	}
 	if !almostEqual(entries[0].RealizedPnL, 599.4) {
@@ -256,7 +338,7 @@ func TestApplyFillSellMultipleLotsFIFO(t *testing.T) {
 	}
 	// 剩余 lot2:30 @120
 	lots := next.positions["AAPL"]
-	if len(lots) != 1 || lots[0].RemainQty != 30 || lots[0].costPerShare != 120 {
+	if len(lots) != 1 || lots[0].Qty != 30 || lots[0].CostPerShare != 120 {
 		t.Errorf("剩余 lots = %+v, want [30 @120]", lots)
 	}
 }

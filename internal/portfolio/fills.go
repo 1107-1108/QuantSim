@@ -3,6 +3,7 @@ package portfolio
 import (
 	"fmt"
 	"math"
+	"sort"
 	"time"
 )
 
@@ -36,11 +37,11 @@ func (f Fill) validate() error {
 		return fmt.Errorf("%w: empty symbol", ErrInvalidFill)
 	case f.Side != SideBuy && f.Side != SideSell:
 		return fmt.Errorf("%w: invalid side %q", ErrInvalidFill, f.Side)
-	case math.IsNaN(f.Qty) || f.Qty <= 0:
+	case math.IsNaN(f.Qty) || math.IsInf(f.Qty, 0) || f.Qty <= 0:
 		return fmt.Errorf("%w: qty must be positive: %v", ErrInvalidFill, f.Qty)
-	case math.IsNaN(f.Price) || f.Price <= 0:
+	case math.IsNaN(f.Price) || math.IsInf(f.Price, 0) || f.Price <= 0:
 		return fmt.Errorf("%w: price must be positive: %v", ErrInvalidFill, f.Price)
-	case math.IsNaN(f.Commission) || f.Commission < 0:
+	case math.IsNaN(f.Commission) || math.IsInf(f.Commission, 0) || f.Commission < 0:
 		return fmt.Errorf("%w: commission must not be negative: %v", ErrInvalidFill, f.Commission)
 	}
 	return nil
@@ -77,12 +78,12 @@ func applyBuy(account Account, fill Fill) (Account, []LedgerEntry, error) {
 
 	// 3. 队尾追加新 lot——FIFO 的对称性:买入永远追加队尾,卖出永远消耗队首,
 	//    队列天然保持 (建仓时间, 成交序号) 升序
-	symbol := InstrumentID(fill.Symbol)
-	next.positions[symbol] = append(next.positions[symbol], Lot{
-		openTime:     fill.Time,
-		openSeq:      fill.Seq,
-		RemainQty:    fill.Qty,
-		costPerShare: costPerShare,
+	symbol := fill.Symbol
+	next.positions[symbol] = insertLot(next.positions[symbol], Lot{
+		OpenTime:     fill.Time,
+		OpenSeq:      fill.Seq,
+		Qty:          fill.Qty,
+		CostPerShare: costPerShare,
 	})
 
 	// 4. 扣现金。现金为负 = 上游购买力校验漏了的 bug:
@@ -107,13 +108,28 @@ func applyBuy(account Account, fill Fill) (Account, []LedgerEntry, error) {
 	return next, []LedgerEntry{entry}, nil
 }
 
+// insertLot 将买入 lot 插入到 (OpenTime, OpenSeq) 升序队列，维持 FIFO 不变量。
+func insertLot(queue []Lot, incoming Lot) []Lot {
+	index := sort.Search(len(queue), func(index int) bool {
+		if queue[index].OpenTime.Equal(incoming.OpenTime) {
+			return queue[index].OpenSeq > incoming.OpenSeq
+		}
+		return queue[index].OpenTime.After(incoming.OpenTime)
+	})
+
+	queue = append(queue, Lot{})
+	copy(queue[index+1:], queue[index:])
+	queue[index] = incoming
+	return queue
+}
+
 // applySell 卖出分支(FIFO 消耗)。
 //
 // 规则:从队首(最早建仓)的 lot 开始消耗;卖出净收入按各 lot 的
 // 消耗数量占比分摊;每个被消耗的 lot 单独记一条 REALIZED_PNL,
 // 这样每笔盈亏都能回溯到具体哪笔买入(LotOpenSeq)。
 func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
-	symbol := InstrumentID(fill.Symbol)
+	symbol := fill.Symbol
 
 	// 1. 持仓校验:超卖 = 上游持仓校验漏了的 bug
 	if held := account.PositionQty(fill.Symbol); fill.Qty > held {
@@ -128,12 +144,12 @@ func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
 	queue := next.positions[symbol]
 
 	var entries []LedgerEntry
-	remaining := fill.Qty   // 还需消耗的数量
-	allocatedSum := 0.0     // 已分摊出去的净收入(供末笔吸收浮点残差)
+	remaining := fill.Qty // 还需消耗的数量
+	allocatedSum := 0.0   // 已分摊出去的净收入(供末笔吸收浮点残差)
 
 	for remaining > 0 {
 		lot := queue[0]
-		take := math.Min(remaining, lot.RemainQty) // 本 lot 被消耗的数量
+		take := math.Min(remaining, lot.Qty) // 本 lot 被消耗的数量
 
 		// 本 lot 分摊的净收入。
 		// take == remaining 时 take 就是 remaining 本身(浮点完全相等,可安全比较),
@@ -148,7 +164,7 @@ func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
 		}
 
 		// 已实现盈亏 = 分摊净收入 − 消耗数量 × 该 lot 的每股成本
-		realized := alloc - take*lot.costPerShare
+		realized := alloc - take*lot.CostPerShare
 		entries = append(entries, LedgerEntry{
 			Time:        fill.Time,
 			Type:        EntryRealizedPnL,
@@ -157,16 +173,16 @@ func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
 			Price:       fill.Price,
 			RealizedPnL: realized,
 			FillSeq:     fill.Seq,
-			LotOpenSeq:  lot.openSeq,
+			LotOpenSeq:  lot.OpenSeq,
 		})
 
 		remaining -= take
-		if take == lot.RemainQty {
+		if take == lot.Qty {
 			queue = queue[1:] // 全部消耗:出队
 		} else {
 			// 部分消耗:剩余部分留在原位(FIFO 顺序不变),
 			// 数量减少,其余字段(成本/建仓时间/序号)不动
-			lot.RemainQty -= take
+			lot.Qty -= take
 			queue[0] = lot
 		}
 	}

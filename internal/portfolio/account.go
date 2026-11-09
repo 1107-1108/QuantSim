@@ -7,71 +7,76 @@ import (
 	"time"
 )
 
-// Lot 批次买入的股票, 也就是一次买入股票的记录
-// OriginalQty 和 RemainQty 在拆股时可能冲突
+// Lot 表示一次买入后尚未卖出的持仓批次。
+//
+// 所有字段均导出，确保 paper trading 快照可以经 encoding/json 无损保存和恢复。
+// Lot 不保存 symbol：所属标的由 Account.positions 的 map key 表达。
 type Lot struct {
-	openTime     time.Time
-	openSeq      uint64  // 在成交时间相同时，保证 FIFO 顺序确定
-	RemainQty    float64 // 经过卖出、拆股等事件调整后的剩余数量
-	costPerShare float64 // 整后的单位成本，不一定等于原始买入价
+	OpenTime     time.Time // 建仓时间，仅用于展示和审计。
+	OpenSeq      uint64    // 建仓成交序号；与 OpenTime 一起保证 FIFO 顺序确定。
+	Qty          float64   // 剩余数量；状态转换后恒大于零。
+	CostPerShare float64   // 含买入佣金的每股成本。
 }
 
-type InstrumentID string // 作为账户 map 的 key，而不是每个 Lot 都重复存储 Symbol
-// 考虑用Symbol
-
+// Account 是不可变账户状态。外部无法直接访问内部 map 或切片，必须通过
+// ApplyFill 和 ApplyCorporateAction 两个状态转换入口创建下一状态。
 type Account struct {
 	initialCash float64
 	cash        float64
-	positions   map[InstrumentID][]Lot
+	positions   map[string][]Lot
 }
 
-// 外部无法直接修改Account内部的数据，只能通过其内部Api
-// Account不可变，每次买卖股票创建一个新的Account
-// Copy-on-write
-
-// Cash 返回账户里的cash
+// Cash 返回账户当前可用现金。
 func (account *Account) Cash() float64 {
 	return account.cash
 }
 
-// PositionQty 对某个股票下所有lot的剩余数量求和
+// InitialCash 返回账户创建时的初始现金，用于收益基准和守恒校验。
+func (account *Account) InitialCash() float64 {
+	return account.initialCash
+}
+
+// PositionQty 返回一个标的全部未平仓 lot 的数量之和。
 func (account *Account) PositionQty(symbol string) float64 {
 	var total float64
-	for _, lot := range account.positions[InstrumentID(symbol)] {
-		total += lot.RemainQty
+	for _, lot := range account.positions[symbol] {
+		total += lot.Qty
 	}
 	return total
 }
 
-// CostBasis 剩余持仓的总成本基础
+// CostBasis 返回一个标的全部未平仓 lot 的成本基础。
 func (account *Account) CostBasis(symbol string) float64 {
 	var total float64
-	for _, lot := range account.positions[InstrumentID(symbol)] {
-		total += lot.RemainQty * lot.costPerShare
+	for _, lot := range account.positions[symbol] {
+		total += lot.Qty * lot.CostPerShare
 	}
 	return total
 }
 
-// AvgCost 每股平均成本
+// AvgCost 返回展示用的加权平均成本；无持仓时返回零而不是 NaN。
 func (account *Account) AvgCost(symbol string) float64 {
-	res := account.CostBasis(symbol) / account.PositionQty(symbol)
-	return res
+	qty := account.PositionQty(symbol)
+	if qty == 0 {
+		return 0
+	}
+	return account.CostBasis(symbol) / qty
 }
 
-// BuyingPower 你现在还能拿多少钱去买股票
+// BuyingPower 返回当前购买力；P0 不支持保证金，因此它等于现金。
 func (account *Account) BuyingPower() float64 {
 	return account.cash
 }
 
+// NewAccount 创建一个没有持仓的账户；初始现金必须是有限且非负的金额。
 func NewAccount(initialCash float64) (Account, error) {
-	if math.IsNaN(initialCash) || initialCash < 0 {
-		err := fmt.Errorf("initialCash can't be negative or NaN")
-		return Account{}, err
+	if math.IsNaN(initialCash) || math.IsInf(initialCash, 0) || initialCash < 0 {
+		return Account{}, fmt.Errorf("initial cash must be finite and non-negative")
 	}
 	return Account{
 		initialCash: initialCash,
 		cash:        initialCash,
-		positions:   make(map[InstrumentID][]Lot),
+		positions:   make(map[string][]Lot),
 	}, nil
 }
 
@@ -84,7 +89,7 @@ func (account *Account) clone() Account {
 	next := Account{
 		initialCash: account.initialCash,
 		cash:        account.cash,
-		positions:   make(map[InstrumentID][]Lot, len(account.positions)),
+		positions:   make(map[string][]Lot, len(account.positions)),
 	}
 	for symbol, lots := range account.positions {
 		next.positions[symbol] = slices.Clone(lots)

@@ -76,7 +76,7 @@ func VerifyConservation(initialCash float64, account Account, entries []LedgerEn
 	// 左项:现金 + 全部持仓的成本基础
 	lhs := account.cash
 	for symbol := range account.positions {
-		lhs += account.CostBasis(string(symbol))
+		lhs += account.CostBasis(symbol)
 	}
 
 	// 右项的两个账本聚合量
