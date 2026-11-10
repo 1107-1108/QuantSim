@@ -5,7 +5,7 @@ updates:
     directory: "/internal"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit:
+    open-pull-requests-limit: 5
 
   # GitHub Actions
   - package-ecosystem: "github-actions"

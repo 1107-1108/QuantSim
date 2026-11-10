@@ -21,7 +21,7 @@ jobs:
           cache: true
 
       - name: Verify go.mod/ go.sum in sync
-        run: go mod verify
+        run: go -C internal mod verify
 
       - name: Test
         run: go -C internal test ./... -count=1
