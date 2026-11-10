@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Go modules under internal/
+  - package-ecosystem: "gomod"
+    directory: "/internal"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit:
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
