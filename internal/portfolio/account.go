@@ -12,10 +12,10 @@ import (
 // 所有字段均导出，确保 paper trading 快照可以经 encoding/json 无损保存和恢复。
 // Lot 不保存 symbol：所属标的由 Account.positions 的 map key 表达。
 type Lot struct {
-	OpenTime     time.Time // 建仓时间，仅用于展示和审计。
-	OpenSeq      uint64    // 建仓成交序号；与 OpenTime 一起保证 FIFO 顺序确定。
-	Qty          float64   // 剩余数量；状态转换后恒大于零。
-	CostPerShare float64   // 含买入佣金的每股成本。
+	OpenTime     time.Time // Position-open time, used only for display and audit.
+	OpenSeq      uint64    // Open-fill sequence; with OpenTime it gives deterministic FIFO order.
+	Qty          float64   // Remaining quantity; always positive after a state transition.
+	CostPerShare float64   // Per-share cost including buy commission.
 }
 
 // Account 是不可变账户状态。外部无法直接访问内部 map 或切片，必须通过

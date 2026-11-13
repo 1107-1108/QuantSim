@@ -124,20 +124,20 @@ type YahooResponse struct {
 // start 和 end 必须使用 YYYY-MM-DD 格式；end 表示不包含在结果中的结束日期。
 func YahooApiMaker(symbol, start, end, adjClose, interval string) (string, error) {
 	if strings.TrimSpace(symbol) == "" {
-		return "", fmt.Errorf("股票代码不能为空")
+		return "", fmt.Errorf("symbol cannot be empty")
 	}
 
 	layout := "2006-01-02"
 	parsedStart, err := time.Parse(layout, start)
 	if err != nil {
-		return "", fmt.Errorf("解析开始日期 %q: %w", start, err)
+		return "", fmt.Errorf("parse start date %q: %w", start, err)
 	}
 	parsedEnd, err := time.Parse(layout, end)
 	if err != nil {
-		return "", fmt.Errorf("解析结束日期 %q: %w", end, err)
+		return "", fmt.Errorf("parse end date %q: %w", end, err)
 	}
 	if !parsedStart.Before(parsedEnd) {
-		return "", fmt.Errorf("开始日期 %s 必须早于结束日期 %s", start, end)
+		return "", fmt.Errorf("start date %s must be before end date %s", start, end)
 	}
 
 	return yahoo_url + url.PathEscape(symbol) + "?period1=" +
@@ -149,28 +149,28 @@ func YahooApiMaker(symbol, start, end, adjClose, interval string) (string, error
 // GetResponseWithClient 使用调用方提供的 HTTP 客户端请求 Yahoo 数据。
 func (res *YahooResponse) GetResponseWithClient(client *http.Client, url string) (YahooResponse, error) {
 	if client == nil {
-		return YahooResponse{}, fmt.Errorf("yahoo HTTP 客户端不能为空")
+		return YahooResponse{}, fmt.Errorf("yahoo HTTP client cannot be nil")
 	}
 
 	request, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return YahooResponse{}, fmt.Errorf("创建 Yahoo 请求: %w", err)
+		return YahooResponse{}, fmt.Errorf("create Yahoo request: %w", err)
 	}
 	request.Header.Set("User-Agent", "Mozilla/5.0")
 	request.Header.Add("Accept", "application/json")
 	response, err := client.Do(request)
 	if err != nil {
-		return YahooResponse{}, fmt.Errorf("请求 Yahoo 数据: %w", err)
+		return YahooResponse{}, fmt.Errorf("request Yahoo data: %w", err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return YahooResponse{}, fmt.Errorf("yahoo HTTP 状态错误: %s", response.Status)
+		return YahooResponse{}, fmt.Errorf("unexpected Yahoo HTTP status: %s", response.Status)
 	}
 
 	var data YahooResponse
 	if err := json.NewDecoder(response.Body).Decode(&data); err != nil {
-		return YahooResponse{}, fmt.Errorf("解析 Yahoo JSON: %w", err)
+		return YahooResponse{}, fmt.Errorf("decode Yahoo JSON: %w", err)
 	}
 	if res != nil {
 		*res = data
@@ -185,14 +185,14 @@ func (res *YahooResponse) GetResponse(url string) (YahooResponse, error) {
 
 func ValidateYahooResponse(data YahooResponse) error {
 	if len(data.Chart.Result) == 0 {
-		return fmt.Errorf("yahoo响应缺少result")
+		return fmt.Errorf("yahoo response has no result")
 	}
 	result := data.Chart.Result[0]
 	if len(result.Indicators.Quote) == 0 {
-		return fmt.Errorf("yahoo 响应缺少 quote")
+		return fmt.Errorf("yahoo response has no quote")
 	}
 	if len(result.Indicators.AdjClose) == 0 {
-		return fmt.Errorf("yahoo 响应缺少 adjclose")
+		return fmt.Errorf("yahoo response has no adjclose")
 	}
 
 	want := len(result.Timestamp)
@@ -212,7 +212,7 @@ func ValidateYahooResponse(data YahooResponse) error {
 
 	for _, field := range lengths {
 		if field.got != want {
-			return fmt.Errorf("%s 数组长度为 %d，时间戳数组长度为 %d", field.name, field.got, want)
+			return fmt.Errorf("%s length is %d, timestamp length is %d", field.name, field.got, want)
 		}
 	}
 	return nil
@@ -223,7 +223,7 @@ func ValidateYahooResponse(data YahooResponse) error {
 // 响应校验失败时返回错误，调用方可以区分"无数据"与"数据损坏"。
 func YahooResponse2Bars(response YahooResponse) ([]Bar, error) {
 	if err := ValidateYahooResponse(response); err != nil {
-		return nil, fmt.Errorf("转换 Yahoo 响应为 K 线: %w", err)
+		return nil, fmt.Errorf("convert Yahoo response to bars: %w", err)
 	}
 
 	result := response.Chart.Result[0]
@@ -249,7 +249,7 @@ func YahooResponse2Bars(response YahooResponse) ([]Bar, error) {
 // Date 按交易所时区从首个时段的开市时间推导，避免 UTC 换算导致的日期偏移。
 func YahooResponse2TradingDays(response YahooResponse) ([]TradingDay, error) {
 	if len(response.Chart.Result) == 0 {
-		return nil, fmt.Errorf("yahoo 响应缺少 result")
+		return nil, fmt.Errorf("yahoo response has no result")
 	}
 
 	result := response.Chart.Result[0]
@@ -280,7 +280,7 @@ func YahooResponse2TradingDays(response YahooResponse) ([]TradingDay, error) {
 
 func YahooResponse2CorporateActions(response YahooResponse) ([]CorporateAction, error) {
 	if len(response.Chart.Result) == 0 {
-		return nil, fmt.Errorf("yahoo 响应缺少result")
+		return nil, fmt.Errorf("yahoo response has no result")
 	}
 	result := response.Chart.Result[0]
 	event := result.Event
@@ -300,7 +300,7 @@ func YahooResponse2CorporateActions(response YahooResponse) ([]CorporateAction, 
 
 	for _, action := range event.Splits {
 		if action.Denominator == 0 {
-			return nil, fmt.Errorf("yahoo 拆股数据异常: %s 的 denominator 为 0", result.Meta.Symbol)
+			return nil, fmt.Errorf("invalid Yahoo split data: %s has denominator 0", result.Meta.Symbol)
 		}
 		actionName := ActionSplit
 		if action.Numerator < action.Denominator {

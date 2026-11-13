@@ -103,13 +103,13 @@ func TestYahooApiMaker(t *testing.T) {
 			end         string
 			wantErrPart string
 		}{
-			{"empty symbol", "", "2024-01-02", "2024-01-10", "股票代码不能为空"},
-			{"whitespace-only symbol", "   ", "2024-01-02", "2024-01-10", "股票代码不能为空"},
-			{"start date with wrong format", "AAPL", "2024/01/02", "2024-01-10", "解析开始日期"},
-			{"nonexistent start date", "AAPL", "2024-13-01", "2024-01-10", "解析开始日期"},
-			{"end date with wrong format", "AAPL", "2024-01-02", "not-a-date", "解析结束日期"},
-			{"start date equal to end date", "AAPL", "2024-01-10", "2024-01-10", "必须早于"},
-			{"start date after end date", "AAPL", "2024-01-10", "2024-01-02", "必须早于"},
+			{"empty symbol", "", "2024-01-02", "2024-01-10", "symbol cannot be empty"},
+			{"whitespace-only symbol", "   ", "2024-01-02", "2024-01-10", "symbol cannot be empty"},
+			{"start date with wrong format", "AAPL", "2024/01/02", "2024-01-10", "parse start date"},
+			{"nonexistent start date", "AAPL", "2024-13-01", "2024-01-10", "parse start date"},
+			{"end date with wrong format", "AAPL", "2024-01-02", "not-a-date", "parse end date"},
+			{"start date equal to end date", "AAPL", "2024-01-10", "2024-01-10", "must be before"},
+			{"start date after end date", "AAPL", "2024-01-10", "2024-01-02", "must be before"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -135,7 +135,7 @@ func decodeYahooResponse(t *testing.T, payload string) YahooResponse {
 	t.Helper()
 	var response YahooResponse
 	if err := json.Unmarshal([]byte(payload), &response); err != nil {
-		t.Fatalf("fixture JSON 解析失败: %v", err)
+		t.Fatalf("decode fixture JSON: %v", err)
 	}
 	return response
 }
@@ -250,7 +250,7 @@ func TestYahooResponse2TradingDays(t *testing.T) {
 		// 如果实现按 UTC 取日期，会得到错误的交易日。
 		sydney, err := time.LoadLocation("Australia/Sydney")
 		if err != nil {
-			t.Fatalf("加载时区失败: %v", err)
+			t.Fatalf("load time zone: %v", err)
 		}
 		day1Open := time.Date(2024, 1, 2, 10, 0, 0, 0, sydney)
 		day1Close := time.Date(2024, 1, 2, 16, 0, 0, 0, sydney)
@@ -316,7 +316,7 @@ func TestYahooResponse2TradingDays(t *testing.T) {
 		// Arrange：东京交易所午间休市，一天有两个时段。
 		tokyo, err := time.LoadLocation("Asia/Tokyo")
 		if err != nil {
-			t.Fatalf("加载时区失败: %v", err)
+			t.Fatalf("load time zone: %v", err)
 		}
 		morningOpen := time.Date(2024, 1, 2, 9, 0, 0, 0, tokyo)
 		morningClose := time.Date(2024, 1, 2, 11, 30, 0, 0, tokyo)

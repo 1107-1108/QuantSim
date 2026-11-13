@@ -34,17 +34,11 @@ type LedgerEntry struct {
 	// 由事件循环在累积条目时统一分配,保证全局有序。
 	Seq uint64
 
-	Time   time.Time // 事件发生时间
+	Time   time.Time // Event time.
 	Type   EntryType
 	Symbol string
 
 	// 以下数值字段按类型取用,不用的恒为 0(对照规格 3.4 的字段使用表):
-	//
-	//   类型              Qty            Price   Commission  RealizedPnL  Amount
-	//   TRADE             成交数量       成交价  总佣金      0            0
-	//   REALIZED_PNL      本 lot 消耗量  卖出价  0           本条 realized 0
-	//   DIVIDEND          除息日持仓量   0       0           0            每股分红
-	//   SPLIT_ADJUSTMENT  调整后持仓量   0       0           0            拆股比例 r
 	Qty         float64
 	Price       float64
 	Commission  float64
