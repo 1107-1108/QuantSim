@@ -354,7 +354,7 @@ func (store *MetaStore) CreateImportRun(ctx context.Context, symbol string, time
 		Timeframe:  timeframe,
 		From:       from.UTC(),
 		To:         to.UTC(),
-		StartedAt:  time.Now().UTC(),
+		StartedAt:  time.Now().UTC().Truncate(time.Microsecond),
 		Status:     ImportRunRunning,
 		IssuesJSON: "[]",
 	}
@@ -434,7 +434,7 @@ func (store *MetaStore) finishImportRun(ctx context.Context, id string, status I
 		UPDATE import_runs
 		SET status = ?, finished_at = ?, issues_json = ?, error_message = ?
 		WHERE id = ?
-	`, string(status), time.Now().UTC().UnixMicro(), issuesJSON, errorMessage, id)
+	`, string(status), time.Now().UTC().Truncate(time.Microsecond).UnixMicro(), issuesJSON, errorMessage, id)
 	if err != nil {
 		return fmt.Errorf("update import run %q: %w", id, err)
 	}

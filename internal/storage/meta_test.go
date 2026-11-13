@@ -261,6 +261,24 @@ func TestImportRunLifecycle(t *testing.T) {
 	}
 }
 
+// TestCreateImportRunUsesMicrosecondPrecision 验证返回的导入开始时间与 SQLite 存储精度一致。
+func TestCreateImportRunUsesMicrosecondPrecision(t *testing.T) {
+	store := openTestMetaStore(t)
+	run, err := store.CreateImportRun(
+		context.Background(),
+		"AAPL",
+		datasource.TF1d,
+		time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("CreateImportRun: %v", err)
+	}
+	if run.StartedAt.Nanosecond()%int(time.Microsecond) != 0 {
+		t.Errorf("CreateImportRun StartedAt = %v, want microsecond precision", run.StartedAt)
+	}
+}
+
 // openTestMetaStore 创建会在测试结束时关闭的临时 MetaStore。
 func openTestMetaStore(t *testing.T) *MetaStore {
 	t.Helper()
