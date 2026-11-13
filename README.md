@@ -21,10 +21,10 @@ Thanks a lot for Ashley's Mental and Coffee Support!
 
 | Area | Status |
 | --- | --- |
-| Yahoo Finance data source | In progress |
-| Portfolio and ledger engine | In progress |
-| Parquet market-data storage | In progress |
-| PostgreSQL metadata storage | Planned |
+| Yahoo Finance data source | Done |
+| Portfolio and ledger engine | Done |
+| Parquet market-data storage | Done |
+| SQLite metadata storage | Done |
 | Event-driven backtesting | Planned |
 | Sandboxed Python strategy worker | Planned |
 | React frontend | Planned |
