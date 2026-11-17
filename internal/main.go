@@ -8,8 +8,10 @@ import (
 
 func main() {
 	SymbolList := []string{"AAPL"}
-	responseList := datasource.YahooFetch(SymbolList, "2007-01-01", "2026-11-04", "1d")
-	var AAPLAction []datasource.CorporateAction
+	responseList, err := datasource.YahooFetch(SymbolList, "2007-01-01", "2026-11-04", "1d")
+	if err != nil {
+		log.Fatalln(err)
+	}
 	AAPLAction, err := responseList[0].CorporateActions()
 	if err != nil {
 		log.Fatalln(err)

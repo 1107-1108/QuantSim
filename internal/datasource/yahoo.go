@@ -17,6 +17,15 @@ var yahooHTTPClient = &http.Client{Timeout: yahooRequestTimeout}
 
 const yahooRequestTimeout = 15 * time.Second
 
+// validYahooIntervals 时间帧白名单(与 data.go 的 Timeframe 常量对齐)。
+// interval 会原样拼进 URL query,白名单是防参数注入的边界收口。
+var validYahooIntervals = map[string]bool{
+	string(TF1m):  true,
+	string(TF5m):  true,
+	string(TF1d):  true,
+	string(TF1wk): true,
+}
+
 // TradingPeriod 单个交易时段
 type TradingPeriod struct {
 	Start     int64  `json:"start"`
@@ -139,6 +148,12 @@ func YahooApiMaker(symbol, start, end, adjClose, interval string) (string, error
 	if !parsedStart.Before(parsedEnd) {
 		return "", fmt.Errorf("start date %s must be before end date %s", start, end)
 	}
+	if !validYahooIntervals[interval] {
+		return "", fmt.Errorf("unsupported interval %q", interval)
+	}
+	if adjClose != "true" && adjClose != "false" {
+		return "", fmt.Errorf("invalid adjClose %q", adjClose)
+	}
 
 	return yahoo_url + url.PathEscape(symbol) + "?period1=" +
 		strconv.FormatInt(parsedStart.Unix(), 10) +
@@ -171,6 +186,11 @@ func (res *YahooResponse) GetResponseWithClient(client *http.Client, url string)
 	var data YahooResponse
 	if err := json.NewDecoder(response.Body).Decode(&data); err != nil {
 		return YahooResponse{}, fmt.Errorf("decode Yahoo JSON: %w", err)
+	}
+	// Yahoo 业务错误(如无效 symbol)以 200 + chart.error 返回,必须显式上抛,
+	// 否则下游会把"错误响应"当"成功但空数据"处理,甚至索引空 result panic。
+	if len(data.Chart.Error) > 0 && string(data.Chart.Error) != "null" {
+		return YahooResponse{}, fmt.Errorf("yahoo chart error: %s", string(data.Chart.Error))
 	}
 	if res != nil {
 		*res = data
@@ -363,6 +383,9 @@ func (y *YahooResponse) CorporateActions() ([]CorporateAction, error) {
 }
 
 func (y *YahooResponse) Symbols() (SymbolInfo, error) {
+	if len(y.Chart.Result) == 0 {
+		return SymbolInfo{}, fmt.Errorf("yahoo response has no result")
+	}
 	result := y.Chart.Result[0]
 	meta := result.Meta
 	var assetType AssetType
@@ -388,6 +411,9 @@ func (y *YahooResponse) Symbols() (SymbolInfo, error) {
 
 // Calendar 生成交易日日历
 func (y *YahooResponse) Calendar() ([]TradingDay, error) {
+	if len(y.Chart.Result) == 0 {
+		return nil, fmt.Errorf("yahoo response has no result")
+	}
 	result := y.Chart.Result[0]
 	timestamps := y.Chart.Result[0].Timestamp
 	tradingDays := make([]TradingDay, 0, len(timestamps))
