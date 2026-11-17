@@ -34,7 +34,7 @@ Thanks a lot for Ashley's Mental and Coffee Support!
 
 - **Backend**: Go
 - **Historical OHLCV data**: Parquet
-- **Business data, ledgers, and backtest metadata:** PostgreSQL
+- **Business data, ledgers, and backtest metadata:** SQLite
 - **Frontend**: React
 - **Communication:** RPC between the Go backend and Python worker
 
