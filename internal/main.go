@@ -1,25 +1,42 @@
 package main
 
 import (
-	"FinanceSimulator/datasource"
-	"fmt"
+	"FinanceSimulator/worker"
+	"io"
 	"log"
+	"net/http"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 )
 
+const listenAddr = "127.0.0.1:8001"
+
+// httpConn adapts an HTTP request body / response writer pair to the
+// io.ReadWriteCloser interface required by jsonrpc.NewServerCodec.
+type httpConn struct {
+	in  io.ReadCloser
+	out io.Writer
+}
+
+func (c *httpConn) Read(p []byte) (int, error)  { return c.in.Read(p) }
+func (c *httpConn) Write(p []byte) (int, error) { return c.out.Write(p) }
+func (c *httpConn) Close() error                { return c.in.Close() }
+
 func main() {
-	SymbolList := []string{"AAPL"}
-	responseList, err := datasource.YahooFetch(SymbolList, "2007-01-01", "2026-11-04", "1d")
-	if err != nil {
-		log.Fatalln(err)
+	if err := rpc.Register(new(worker.Service)); err != nil {
+		log.Fatal(err)
 	}
-	AAPLAction, err := responseList[0].CorporateActions()
-	if err != nil {
-		log.Fatalln(err)
+	http.HandleFunc("/", rpcHandler)
+	log.Printf("JSON-RPC server listening on %s", listenAddr)
+	log.Fatal(http.ListenAndServe(listenAddr, nil))
+}
+
+func rpcHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	for _, action := range AAPLAction {
-		if action.Type != datasource.ActionSplit {
-			continue
-		}
-		fmt.Println(action)
-	}
+	w.Header().Set("Content-Type", "application/json")
+	defer r.Body.Close()
+	rpc.ServeCodec(jsonrpc.NewServerCodec(&httpConn{in: r.Body, out: w}))
 }
