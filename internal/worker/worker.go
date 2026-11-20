@@ -20,16 +20,10 @@ type Session struct {
 	orderList []OrderMsg
 }
 
-type WorkerCondition string
-
-const (
-	OK           WorkerCondition = "OK"
-	NoEnoughData WorkerCondition = "NOENOUGHDATA"
-)
-
 type WorkerResponse struct {
-	Seq       uint64          `json:"seq"`
-	Condition WorkerCondition `json:"condition"`
+	Seq        uint64     `json:"seq"`
+	Condition  string     `json:"condition"`
+	OrderBatch []OrderMsg `json:"orderBatch"`
 }
 
 // CreateListener 创建一个Unix Socket
@@ -89,33 +83,50 @@ func (s *Session) OnBar(msgs []BarMsg) error {
 			return err
 		}
 
-		var workerResponse struct {
-			Condition string `json:"condition"`
-			Seq       int    `json:"seq"`
-			Error     string `json:"error"`
-		}
+		var workerResponse WorkerResponse
 
 		if err := json.Unmarshal(response, &workerResponse); err != nil {
 			return err
 		}
 
 		// 验证 Sequence
-		if workerResponse.Seq != int(msg.Seq) {
-			return fmt.Errorf("sequence mismatch: expected %d, got %d",
-				msg.Seq, workerResponse.Seq)
+		if workerResponse.Seq != msg.Seq {
+			return fmt.Errorf(
+				"sequence mismatch: expected %d, got %d",
+				msg.Seq, workerResponse.Seq,
+			)
 		}
 
 		switch workerResponse.Condition {
 		case "OK":
-			// 当前 Bar 处理完成，继续下一帧
+			// Python 处理完成，没有交易信号
 			continue
 
+		case "ORDER":
+			// Python 返回了订单
+			if len(workerResponse.OrderBatch) == 0 {
+				return fmt.Errorf("ORDER response contains no orders")
+			}
+
+			// 把订单加入 Session
+			s.orderList = append(
+				s.orderList,
+				workerResponse.OrderBatch...,
+			)
+
+			// TODO: 将订单交给 Matcher 处理
+
 		case "ERROR":
-			return fmt.Errorf("worker error: %s", workerResponse.Error)
+			return fmt.Errorf(
+				"worker error at sequence %d",
+				workerResponse.Seq,
+			)
 
 		default:
-			return fmt.Errorf("unknown worker condition: %s",
-				workerResponse.Condition)
+			return fmt.Errorf(
+				"unknown worker condition: %s",
+				workerResponse.Condition,
+			)
 		}
 	}
 
