@@ -10,10 +10,8 @@ import (
 	"math"
 	"net"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -21,7 +19,7 @@ import (
 const onBarTestSocket = "/tmp/worker.socket"
 const onBarTestTimeout = 3 * time.Second
 
-func TestOnBarEmptyInput(t *testing.T) {
+func TestStartEmptyInput(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		bars []BarMsg
@@ -30,9 +28,9 @@ func TestOnBarEmptyInput(t *testing.T) {
 		{name: "empty slice", bars: []BarMsg{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session, peer, wait := startOnBarTest(t, tc.bars)
+			session, peer, wait := startSessionTest(t, tc.bars)
 			if err := wait(); err != nil {
-				t.Fatalf("OnBar: %v", err)
+				t.Fatalf("Start: %v", err)
 			}
 			assertOnBarPeerClosed(t, peer)
 			if len(session.orderList) != 0 {
@@ -44,61 +42,60 @@ func TestOnBarEmptyInput(t *testing.T) {
 
 func TestOnBarOK(t *testing.T) {
 	const seq = uint64(1<<64 - 1)
-	session, peer, wait := startOnBarTest(t, []BarMsg{onBarTestBar(seq)})
+	session, peer, wait := startOnBarTest(t, onBarTestBar(seq))
 	assertOnBarRequest(t, peer, seq)
 	sendOnBarBytes(t, peer, onBarTestFrame([]byte(fmt.Sprintf(`{"seq":%d,"condition":"OK"}`, seq))))
 
 	if err := wait(); err != nil {
 		t.Fatalf("OnBar: %v", err)
 	}
-	assertOnBarPeerClosed(t, peer)
+	assertNoNextBar(t, peer)
 	if len(session.orderList) != 0 {
 		t.Errorf("OK produced orders: %+v", session.orderList)
 	}
 }
 
-func TestOnBarReturnsListenerError(t *testing.T) {
-	// A dangling link makes the path unavailable for bind without triggering
-	// the existing-file check in CreateListener.
-	target := filepath.Join(t.TempDir(), "missing-dir", "worker.sock")
-	if err := os.Symlink(target, onBarTestSocket); err != nil {
-		t.Fatalf("reserve the socket path for this test: %v", err)
+func TestStartSocketAlreadyExists(t *testing.T) {
+	file, err := os.OpenFile(onBarTestSocket, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		if err := os.Remove(onBarTestSocket); err != nil {
-			t.Errorf("remove test symlink: %v", err)
+			t.Error(err)
 		}
 	})
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	session := &Session{}
-	err := session.OnBar([]BarMsg{onBarTestBar(7)})
-	if !errors.Is(err, syscall.EADDRINUSE) && !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("OnBar error = %v, want socket bind failure", err)
+	err = session.Start([]BarMsg{onBarTestBar(7)})
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("Start error = %v, want %v", err, os.ErrExist)
+	}
+	if _, err := os.Stat(onBarTestSocket); err != nil {
+		t.Fatalf("Start removed the existing file: %v", err)
 	}
 }
 
 func TestOnBarWaitsForCompleteResponseFrame(t *testing.T) {
-	_, peer, wait := startOnBarTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8)})
+	_, peer, wait := startOnBarTest(t, onBarTestBar(7))
 	assertOnBarRequest(t, peer, 7)
 	frame := onBarTestFrame([]byte(`{"seq":7,"condition":"OK"}`))
 	sendOnBarBytes(t, peer, frame[:2])
-	assertOnBarWaitsForResponse(t, peer)
 	sendOnBarBytes(t, peer, frame[2:6])
-	assertOnBarWaitsForResponse(t, peer)
 	sendOnBarBytes(t, peer, frame[6:])
 
-	assertOnBarRequest(t, peer, 8)
-	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":8,"condition":"OK"}`)))
 	if err := wait(); err != nil {
 		t.Fatalf("OnBar: %v", err)
 	}
-	assertOnBarPeerClosed(t, peer)
 }
 
-func TestOnBarWaitsForResponsesAndAccumulatesOrders(t *testing.T) {
-	session, peer, wait := startOnBarTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8), onBarTestBar(9)})
+func TestStartWaitsForResponsesAndAccumulatesOrders(t *testing.T) {
+	session, peer, wait := startSessionTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8), onBarTestBar(9)})
 	assertOnBarRequest(t, peer, 7)
-	assertOnBarWaitsForResponse(t, peer)
+	assertNoNextBar(t, peer)
 	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":7,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"BUY","type":"MARKET","qty":2}]}`)))
 
 	assertOnBarRequest(t, peer, 8)
@@ -108,7 +105,7 @@ func TestOnBarWaitsForResponsesAndAccumulatesOrders(t *testing.T) {
 	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":9,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"SELL","type":"LIMIT","qty":1,"limit_price":112.5},{"symbol":"MSFT","side":"BUY","type":"MARKET","qty":3}]}`)))
 
 	if err := wait(); err != nil {
-		t.Fatalf("OnBar: %v", err)
+		t.Fatalf("Start: %v", err)
 	}
 	assertOnBarPeerClosed(t, peer)
 	want := []OrderMsg{
@@ -119,6 +116,11 @@ func TestOnBarWaitsForResponsesAndAccumulatesOrders(t *testing.T) {
 	if !reflect.DeepEqual(session.orderList, want) {
 		t.Errorf("orders = %+v, want %+v", session.orderList, want)
 	}
+}
+
+func TestOnBarRejectsNilConnection(t *testing.T) {
+	session := &Session{}
+	assertOnBarError(t, session.OnBar(nil, onBarTestBar(7)), "worker connection is nil")
 }
 
 func TestOnBarRejectsInvalidInput(t *testing.T) {
@@ -134,7 +136,7 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bar := onBarTestBar(7)
 			tc.invalidate(&bar)
-			session, peer, wait := startOnBarTest(t, []BarMsg{bar, onBarTestBar(8)})
+			session, _, wait := startOnBarTest(t, bar)
 			if err := wait(); tc.want != "" {
 				assertOnBarError(t, err, tc.want)
 			} else {
@@ -143,7 +145,6 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 					t.Fatalf("OnBar error = %v, want *json.UnsupportedValueError", err)
 				}
 			}
-			assertOnBarPeerClosed(t, peer)
 			if len(session.orderList) != 0 {
 				t.Errorf("invalid input produced orders: %+v", session.orderList)
 			}
@@ -154,16 +155,12 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 func TestOnBarRejectsOversizedRequest(t *testing.T) {
 	bar := onBarTestBar(7)
 	bar.Symbol = strings.Repeat("A", 16<<20)
-	_, peer, wait := startOnBarTest(t, []BarMsg{bar})
+	_, _, wait := startOnBarTest(t, bar)
 	assertOnBarError(t, wait(), "exceeds")
-	assertOnBarPeerClosed(t, peer)
 }
 
 func TestOnBarReturnsWriteError(t *testing.T) {
-	bar := onBarTestBar(7)
-	// A large request keeps the write pending when the peer closes after the header.
-	bar.Symbol = strings.Repeat("A", 8<<20)
-	_, peer, wait := startOnBarTest(t, []BarMsg{bar})
+	_, peer, wait := startOnBarTest(t, onBarTestBar(7))
 	var header [4]byte
 	if _, err := io.ReadFull(peer, header[:]); err != nil {
 		t.Fatalf("read request header: %v", err)
@@ -188,12 +185,12 @@ func TestOnBarRejectsInvalidResponseFrames(t *testing.T) {
 		{name: "oversized length", frame: []byte{1, 0, 0, 1}, want: "invalid frame length"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session, peer, wait := startOnBarTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8)})
+			session, peer, wait := startOnBarTest(t, onBarTestBar(7))
 			assertOnBarRequest(t, peer, 7)
 			if len(tc.frame) > 0 {
 				sendOnBarBytes(t, peer, tc.frame)
 			}
-			if err := peer.CloseWrite(); err != nil {
+			if err := peer.Close(); err != nil {
 				t.Fatalf("close response stream: %v", err)
 			}
 
@@ -202,7 +199,6 @@ func TestOnBarRejectsInvalidResponseFrames(t *testing.T) {
 			if tc.cause != nil && !errors.Is(err, tc.cause) {
 				t.Errorf("OnBar error = %v, want wrapped %v", err, tc.cause)
 			}
-			assertOnBarPeerClosed(t, peer)
 			if len(session.orderList) != 0 {
 				t.Errorf("invalid frame produced orders: %+v", session.orderList)
 			}
@@ -230,11 +226,10 @@ func TestOnBarRejectsInvalidResponses(t *testing.T) {
 		{name: "empty orders", payload: `{"seq":7,"condition":"ORDER","orderBatch":[]}`, want: "ORDER response contains no orders"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session, peer, wait := startOnBarTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8)})
+			session, peer, wait := startOnBarTest(t, onBarTestBar(7))
 			assertOnBarRequest(t, peer, 7)
 			sendOnBarBytes(t, peer, onBarTestFrame([]byte(tc.payload)))
 			assertOnBarError(t, wait(), tc.want)
-			assertOnBarPeerClosed(t, peer)
 			if len(session.orderList) != 0 {
 				t.Errorf("invalid response produced orders: %+v", session.orderList)
 			}
@@ -242,8 +237,8 @@ func TestOnBarRejectsInvalidResponses(t *testing.T) {
 	}
 }
 
-func TestOnBarStopsAfterLaterError(t *testing.T) {
-	session, peer, wait := startOnBarTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8), onBarTestBar(9)})
+func TestStartStopsAfterLaterError(t *testing.T) {
+	session, peer, wait := startSessionTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8), onBarTestBar(9)})
 	assertOnBarRequest(t, peer, 7)
 	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":7,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"BUY","type":"MARKET","qty":2}]}`)))
 	assertOnBarRequest(t, peer, 8)
@@ -257,9 +252,38 @@ func TestOnBarStopsAfterLaterError(t *testing.T) {
 	}
 }
 
-func startOnBarTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func() error) {
+func startOnBarTest(t *testing.T, bar BarMsg) (*Session, net.Conn, func() error) {
 	t.Helper()
-	// OnBar binds a fixed socket path. Keep these tests serial and preserve any existing socket.
+	conn, peer := net.Pipe()
+	t.Cleanup(func() {
+		conn.Close()
+		peer.Close()
+	})
+	if err := peer.SetDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
+		t.Fatal(err)
+	}
+
+	session := &Session{}
+	result := make(chan error, 1)
+	go func() {
+		result <- session.OnBar(conn, bar)
+	}()
+	wait := func() error {
+		t.Helper()
+		select {
+		case err := <-result:
+			return err
+		case <-time.After(onBarTestTimeout):
+			t.Fatal("OnBar did not return")
+			return nil
+		}
+	}
+	return session, peer, wait
+}
+
+func startSessionTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func() error) {
+	t.Helper()
+	// Start binds a fixed socket path. Keep these tests serial and preserve any existing socket.
 	if _, err := os.Lstat(onBarTestSocket); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("need an unused %s (stat error: %v)", onBarTestSocket, err)
 	}
@@ -268,7 +292,7 @@ func startOnBarTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func(
 	finished := make(chan struct{})
 	var runErr error
 	go func() {
-		runErr = session.OnBar(bars)
+		runErr = session.Start(bars)
 		close(finished)
 	}()
 
@@ -286,9 +310,9 @@ func startOnBarTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func(
 		}
 		select {
 		case <-finished:
-			t.Fatalf("OnBar exited before worker connected: %v", runErr)
+			t.Fatalf("Start exited before worker connected: %v", runErr)
 		case <-deadline.C:
-			t.Fatalf("timed out connecting the test worker: %v", err)
+			t.Fatalf("timed out connecting the test worker to Start: %v", err)
 		case <-retry.C:
 		}
 	}
@@ -298,7 +322,7 @@ func startOnBarTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func(
 		case <-finished:
 			return runErr
 		case <-time.After(onBarTestTimeout):
-			t.Fatal("OnBar did not return")
+			t.Fatal("Start did not return")
 			return nil
 		}
 	}
@@ -307,10 +331,10 @@ func startOnBarTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func(
 		select {
 		case <-finished:
 			if _, err := os.Lstat(onBarTestSocket); !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("listener socket still present after OnBar (stat error: %v)", err)
+				t.Errorf("listener socket still present after Start (stat error: %v)", err)
 			}
 		case <-time.After(onBarTestTimeout):
-			t.Error("OnBar did not return after disconnecting the test worker")
+			t.Error("Start did not return after disconnecting the test worker")
 		}
 	})
 	if err := peer.SetDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
@@ -377,14 +401,14 @@ func sendOnBarBytes(t *testing.T, peer io.Writer, frame []byte) {
 	}
 }
 
-func assertOnBarWaitsForResponse(t *testing.T, peer *net.UnixConn) {
+func assertNoNextBar(t *testing.T, peer net.Conn) {
 	t.Helper()
 	if err := peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatalf("set read deadline: %v", err)
 	}
 	var next [1]byte
 	if n, err := peer.Read(next[:]); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("expected OnBar to wait for a response, read %d bytes with %v", n, err)
+		t.Fatalf("expected no additional frame, read %d bytes with %v", n, err)
 	}
 	if err := peer.SetReadDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
 		t.Fatalf("reset read deadline: %v", err)

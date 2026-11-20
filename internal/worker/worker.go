@@ -30,22 +30,20 @@ type WorkerResponse struct {
 // sockName 文件名
 func (s *Session) CreateListener(sockName string) error {
 	sPath := fmt.Sprintf("/tmp/%s", sockName)
-	_, err := os.Stat(sPath)
-	if err == nil {
-		log.Fatalln("Socket exists!")
-		return err
+	if _, err := os.Lstat(sPath); err == nil {
+		return fmt.Errorf("socket %s already exists: %w", sPath, os.ErrExist)
 	}
 	socket, err := net.Listen("unix", sPath)
-	log.Println("Socket created successfully")
 	if err != nil {
 		return err
 	}
 	s.socket = socket
+	log.Println("Socket created successfully")
 	return nil
 }
 
-// OnBar往python推送bar进行运算
-func (s *Session) OnBar(msgs []BarMsg) error {
+// Start 等待 Python Worker 连接，再逐帧发送 Bar。
+func (s *Session) Start(msgs []BarMsg) error {
 	// 创建 Socket Listener
 	if err := s.CreateListener("worker.socket"); err != nil {
 		return err
@@ -61,73 +59,82 @@ func (s *Session) OnBar(msgs []BarMsg) error {
 
 	// 逐帧发送 Bar
 	for _, msg := range msgs {
-		// Validity Check
-		if msg.Seq == 0 {
-			return fmt.Errorf("sequence number cannot be 0")
-		}
-
-		// 序列化 BarMsg
-		data, err := json.Marshal(msg)
-		if err != nil {
+		if err := s.OnBar(conn, msg); err != nil {
 			return err
 		}
+	}
 
-		// 发送当前 Bar
-		if err := writeFrame(conn, data); err != nil {
-			return err
+	return nil
+}
+
+// OnBar 往 Python 推送一根 Bar，并等待这一帧的响应。
+func (s *Session) OnBar(conn net.Conn, msg BarMsg) error {
+	if conn == nil {
+		return fmt.Errorf("worker connection is nil")
+	}
+	if msg.Seq == 0 {
+		return fmt.Errorf("sequence number cannot be 0")
+	}
+
+	// 序列化 BarMsg
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	// 发送当前 Bar
+	if err := writeFrame(conn, data); err != nil {
+		return err
+	}
+
+	// 等待 Python Worker 返回确认
+	response, err := readFrame(conn)
+	if err != nil {
+		return err
+	}
+
+	var workerResponse WorkerResponse
+	if err := json.Unmarshal(response, &workerResponse); err != nil {
+		return err
+	}
+
+	// 验证 Sequence
+	if workerResponse.Seq != msg.Seq {
+		return fmt.Errorf(
+			"sequence mismatch: expected %d, got %d",
+			msg.Seq, workerResponse.Seq,
+		)
+	}
+
+	switch workerResponse.Condition {
+	case "OK":
+		// Python 处理完成，没有交易信号
+		return nil
+
+	case "ORDER":
+		if len(workerResponse.OrderBatch) == 0 {
+			return fmt.Errorf("ORDER response contains no orders")
 		}
 
-		// 等待 Python Worker 返回确认
-		response, err := readFrame(conn)
-		if err != nil {
-			return err
-		}
+		// 把订单加入 Session
+		s.orderList = append(
+			s.orderList,
+			workerResponse.OrderBatch...,
+		)
 
-		var workerResponse WorkerResponse
+		// TODO: 将订单交给 Matcher 处理
 
-		if err := json.Unmarshal(response, &workerResponse); err != nil {
-			return err
-		}
+	case "ERROR":
+		return fmt.Errorf(
+			"worker error at sequence %d",
+			workerResponse.Seq,
+		)
 
-		// 验证 Sequence
-		if workerResponse.Seq != msg.Seq {
-			return fmt.Errorf(
-				"sequence mismatch: expected %d, got %d",
-				msg.Seq, workerResponse.Seq,
-			)
-		}
-
-		switch workerResponse.Condition {
-		case "OK":
-			// Python 处理完成，没有交易信号
-			continue
-
-		case "ORDER":
-			// Python 返回了订单
-			if len(workerResponse.OrderBatch) == 0 {
-				return fmt.Errorf("ORDER response contains no orders")
-			}
-
-			// 把订单加入 Session
-			s.orderList = append(
-				s.orderList,
-				workerResponse.OrderBatch...,
-			)
-
-			// TODO: 将订单交给 Matcher 处理
-
-		case "ERROR":
-			return fmt.Errorf(
-				"worker error at sequence %d",
-				workerResponse.Seq,
-			)
-
-		default:
-			return fmt.Errorf(
-				"unknown worker condition: %s",
-				workerResponse.Condition,
-			)
-		}
+	default:
+		return fmt.Errorf(
+			"unknown worker condition: %s",
+			workerResponse.Condition,
+		)
 	}
 
 	return nil
