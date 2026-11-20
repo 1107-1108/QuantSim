@@ -1,6 +1,6 @@
 module FinanceSimulator
 
-go 1.27.0
+go 1.27.4
 
 require (
 	github.com/google/uuid v1.6.0
