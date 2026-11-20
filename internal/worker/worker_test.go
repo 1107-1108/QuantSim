@@ -2,28 +2,24 @@ package worker
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 )
 
-func TestWriteFrame(t *testing.T) {
-	var buf bytes.Buffer
+func TestEncodeFrame(t *testing.T) {
 	data := []byte(`{"method":"on_bar"}`)
 
-	err := writeFrame(&buf, data)
+	frame, err := encodeFrame(data)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	fmt.Println("Buffer length:", buf.Len())
-	if buf.Len() != 23 {
-		t.Error("Buffer length error")
+	if len(frame) != 23 {
+		t.Errorf("frame length = %d, want 23", len(frame))
 	}
-	result, err := readFrame(&buf)
+	result, err := readFrame(bytes.NewReader(frame))
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	fmt.Println("Received", string(result))
-	if string(result) != string(data) {
-		t.Error("Data not the same!")
+	if !bytes.Equal(result, data) {
+		t.Errorf("payload = %q, want %q", result, data)
 	}
 }

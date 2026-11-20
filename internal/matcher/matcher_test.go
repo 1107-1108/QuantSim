@@ -225,6 +225,35 @@ func TestMatch_LimitSellNoFillWhenHighBelowLimit(t *testing.T) {
 	}
 }
 
+func TestMatch_LimitPriceBoundsSlippage(t *testing.T) {
+	cases := []struct {
+		name       string
+		side       portfolio.Side
+		limitPrice float64
+		wantPrice  float64
+	}{
+		{name: "buy touched intrabar", side: portfolio.SideBuy, limitPrice: 99.5, wantPrice: 99.5},
+		{name: "sell touched intrabar", side: portfolio.SideSell, limitPrice: 101, wantPrice: 101},
+		{name: "buy slippage crosses limit from open", side: portfolio.SideBuy, limitPrice: 100.05, wantPrice: 100.05},
+		{name: "sell slippage crosses limit from open", side: portfolio.SideSell, limitPrice: 99.95, wantPrice: 99.95},
+		{name: "buy slippage stays within limit", side: portfolio.SideBuy, limitPrice: 101, wantPrice: 100.1},
+		{name: "sell slippage stays within limit", side: portfolio.SideSell, limitPrice: 99, wantPrice: 99.9},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			order := matcher.Order{ID: 1, Symbol: "AAPL", Qty: 10, Type: matcher.LimitOrder, Side: tc.side, LimitPrice: tc.limitPrice}
+
+			fill, status, err := matcher.Match(order, testBar, matcher.CostModel{SlippageBps: 10})
+			if err != nil || status != matcher.MatchFilled || fill == nil {
+				t.Fatalf("Match returned fill %+v, status %v and error %v, want a fill", fill, status, err)
+			}
+			if !almostEqual(fill.Price, tc.wantPrice) {
+				t.Errorf("fill price = %v, want %v", fill.Price, tc.wantPrice)
+			}
+		})
+	}
+}
+
 func TestMatch_SlippageRaisesBuyPrice(t *testing.T) {
 	// Arrange:10bps 滑点,买入价朝不利方向(上)偏移:100 × 1.001 = 100.1
 	order := matcher.Order{

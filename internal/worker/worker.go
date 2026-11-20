@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +31,7 @@ type Session struct {
 
 	socket    net.Listener
 	orderList []OrderMsg
+	running   atomic.Bool
 }
 
 type WorkerResponse struct {
@@ -54,11 +56,15 @@ func (s *Session) CreateListener(sockName string) error {
 	return nil
 }
 
-// Start 启动 Python Worker，等待连接后逐帧发送 Bar。
+// Start 启动 Python Worker，等待连接后逐帧发送 Bar。同一 Session 一次只能运行一个 Worker。
 func (s *Session) Start(ctx context.Context, msgs []BarMsg) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !s.running.CompareAndSwap(false, true) {
+		return fmt.Errorf("worker session is already running")
+	}
+	defer s.running.Store(false)
 
 	python := s.PythonPath
 	if python == "" {
@@ -77,11 +83,16 @@ func (s *Session) Start(ctx context.Context, msgs []BarMsg) error {
 		barTimeout = defaultBarTimeout
 	}
 
-	// 创建 Socket Listener
-	if err := s.CreateListener("worker.socket"); err != nil {
-		return err
+	// 使用短路径，避免较长的 TMPDIR 超出 Unix Socket 的路径长度上限。
+	socketDir, err := os.MkdirTemp("/tmp", "finance-worker-")
+	if err != nil {
+		return fmt.Errorf("create worker socket directory: %w", err)
 	}
-	listener := s.socket
+	defer os.RemoveAll(socketDir)
+	listener, err := net.Listen("unix", filepath.Join(socketDir, "worker.sock"))
+	if err != nil {
+		return fmt.Errorf("listen for Python worker: %w", err)
+	}
 	defer listener.Close()
 
 	workerCtx, stopWorker := context.WithCancel(ctx)
@@ -181,7 +192,8 @@ func workerScriptPath(script string) (string, error) {
 	}
 }
 
-// OnBar 往 Python 推送一根 Bar，并返回这一帧产生的订单。
+// OnBar 往 Python 推送一根 Bar，并返回这一帧产生的订单。同一连接上的调用须串行执行。
+// 开始发送后的读写或协议错误会关闭连接。发送前的校验错误和完整的 ERROR 响应会保留连接。
 func (s *Session) OnBar(ctx context.Context, conn net.Conn, msg BarMsg) (orders []OrderMsg, err error) {
 	if conn == nil {
 		return nil, fmt.Errorf("worker connection is nil")
@@ -192,41 +204,54 @@ func (s *Session) OnBar(ctx context.Context, conn net.Conn, msg BarMsg) (orders 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := encodeFrame(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	deadline, hasDeadline := ctx.Deadline()
 	if hasDeadline {
 		if err := conn.SetDeadline(deadline); err != nil {
 			return nil, err
 		}
 	}
-	if ctx.Done() != nil {
-		interrupted := make(chan struct{})
-		stop := context.AfterFunc(ctx, func() {
-			conn.SetDeadline(time.Now())
-			close(interrupted)
-		})
-		defer func() {
-			if !stop() {
-				<-interrupted
-				hasDeadline = true
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		conn.SetDeadline(time.Now())
+		close(interrupted)
+	})
+	reusable := false
+	defer func() {
+		if !stop() {
+			<-interrupted
+			hasDeadline = true
+		}
+		if !reusable {
+			conn.Close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				err = ctxErr
 			}
-			if hasDeadline {
-				conn.SetDeadline(time.Time{})
-			}
-			if err != nil && ctx.Err() != nil {
-				err = ctx.Err()
-			}
-		}()
-	}
-
-	// 序列化 BarMsg
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
+			return
+		}
+		if hasDeadline {
+			conn.SetDeadline(time.Time{})
+		}
+	}()
 
 	// 发送当前 Bar
-	if err := writeFrame(conn, data); err != nil {
-		return nil, err
+	n, err := conn.Write(frame)
+	if err != nil {
+		return nil, fmt.Errorf("write frame: %w", err)
+	}
+	if n != len(frame) {
+		return nil, fmt.Errorf("write frame: %w", io.ErrShortWrite)
 	}
 
 	// 等待 Python Worker 返回确认
@@ -251,15 +276,18 @@ func (s *Session) OnBar(ctx context.Context, conn net.Conn, msg BarMsg) (orders 
 	switch workerResponse.Condition {
 	case "OK":
 		// Python 处理完成，没有交易信号
+		reusable = true
 		return nil, nil
 
 	case "ORDER":
 		if len(workerResponse.OrderBatch) == 0 {
 			return nil, fmt.Errorf("ORDER response contains no orders")
 		}
+		reusable = true
 		return workerResponse.OrderBatch, nil
 
 	case "ERROR":
+		reusable = true
 		return nil, fmt.Errorf(
 			"worker error at sequence %d",
 			workerResponse.Seq,
@@ -273,18 +301,15 @@ func (s *Session) OnBar(ctx context.Context, conn net.Conn, msg BarMsg) (orders 
 	}
 }
 
-// writeFrame 完整写出一帧;长度超上限是协议错误,在写之前拒绝。
-func writeFrame(w io.Writer, payload []byte) error {
+// encodeFrame 加上帧头，并在写之前拒绝超过上限的负载。
+func encodeFrame(payload []byte) ([]byte, error) {
 	if len(payload) > maxFrameSize {
-		return fmt.Errorf("frame payload %d bytes exceeds %d limit", len(payload), maxFrameSize)
+		return nil, fmt.Errorf("frame payload %d bytes exceeds %d limit", len(payload), maxFrameSize)
 	}
 	frame := make([]byte, 4+len(payload))
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
 	copy(frame[4:], payload)
-	if _, err := w.Write(frame); err != nil {
-		return fmt.Errorf("write frame: %w", err)
-	}
-	return nil
+	return frame, nil
 }
 
 // readFrame 读取完整一帧;io.ReadFull 处理短读与粘包

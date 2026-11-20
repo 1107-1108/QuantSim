@@ -233,6 +233,47 @@ func TestApplyFillBuyInsufficientCashReturnsErrNegativeCash(t *testing.T) {
 	}
 }
 
+func TestApplyFillSellCommissionRequiresAvailableCash(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		initialCash float64
+		wantErr     error
+	}{
+		{name: "insufficient cash", initialCash: 2, wantErr: ErrNegativeCash},
+		{name: "exact cash", initialCash: 2.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account, err := NewAccount(tc.initialCash)
+			if err != nil {
+				t.Fatalf("NewAccount: %v", err)
+			}
+			holding, _, err := ApplyFill(account, Fill{Seq: 1, Symbol: "AAPL", Side: SideBuy, Qty: 1, Price: 1, Commission: 1, Time: testTime1})
+			if err != nil {
+				t.Fatalf("buy: %v", err)
+			}
+			before := snapshotAccount(holding)
+
+			next, entries, err := ApplyFill(holding, Fill{Seq: 2, Symbol: "AAPL", Side: SideSell, Qty: 1, Price: 0.5, Commission: 1, Time: testTime2})
+
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("sell error = %v, want %v", err, tc.wantErr)
+			}
+			if !reflect.DeepEqual(holding, before) {
+				t.Error("sell changed the input account")
+			}
+			if tc.wantErr != nil {
+				if entries != nil || !reflect.DeepEqual(next, before) {
+					t.Errorf("rejected sale returned account %+v and ledger %+v, want unchanged account and no entries", next, entries)
+				}
+				return
+			}
+			if next.Cash() != 0 || next.PositionQty("AAPL") != 0 || len(entries) != 2 {
+				t.Errorf("accepted sale returned cash %v, position %v, ledger %+v, want zero cash, zero position, and two entries", next.Cash(), next.PositionQty("AAPL"), entries)
+			}
+		})
+	}
+}
+
 func TestApplyFillSellEntirePositionDeletesSymbol(t *testing.T) {
 	// Arrange:先买 100 @100 佣金 1,再全卖 @110 佣金 1
 	account, _ := NewAccount(11_000)
@@ -340,6 +381,28 @@ func TestApplyFillSellMultipleLotsFIFO(t *testing.T) {
 	lots := next.positions["AAPL"]
 	if len(lots) != 1 || lots[0].Qty != 30 || lots[0].CostPerShare != 120 {
 		t.Errorf("剩余 lots = %+v, want [30 @120]", lots)
+	}
+}
+
+func TestApplyFillPartialSaleStopsAtFractionalLotBoundary(t *testing.T) {
+	account, _ := NewAccount(100)
+	for i, qty := range []float64{0.1, 0.2, 0.4} {
+		var err error
+		account, _, err = ApplyFill(account, Fill{Seq: uint64(i + 1), Symbol: "AAPL", Side: SideBuy, Qty: qty, Price: 10, Time: testTime1})
+		if err != nil {
+			t.Fatalf("buy: %v", err)
+		}
+	}
+
+	next, entries, err := ApplyFill(account, Fill{Seq: 4, Symbol: "AAPL", Side: SideSell, Qty: 0.30000000000000004, Price: 20, Time: testTime2})
+	if err != nil {
+		t.Fatalf("sell: %v", err)
+	}
+	if lots := next.positions["AAPL"]; len(lots) != 1 || lots[0].Qty != 0.4 || lots[0].OpenSeq != 3 {
+		t.Errorf("remaining lots = %+v, want the untouched third lot of 0.4 shares", lots)
+	}
+	if len(entries) != 3 || entries[0].LotOpenSeq != 1 || entries[1].LotOpenSeq != 2 || entries[2].Type != EntryTrade {
+		t.Errorf("entries = %+v, want PnL realized from the first two lots followed by one trade", entries)
 	}
 }
 

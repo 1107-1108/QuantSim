@@ -112,15 +112,15 @@ type YahooResponse struct {
 
 			Indicators struct {
 				Quote []struct {
-					Open   []float64 `json:"open"`
-					High   []float64 `json:"high"`
-					Low    []float64 `json:"low"`
-					Close  []float64 `json:"close"`
-					Volume []int64   `json:"volume"`
+					Open   []*float64 `json:"open"`
+					High   []*float64 `json:"high"`
+					Low    []*float64 `json:"low"`
+					Close  []*float64 `json:"close"`
+					Volume []*int64   `json:"volume"`
 				} `json:"quote"`
 
 				AdjClose []struct {
-					Values []float64 `json:"adjclose"`
+					Values []*float64 `json:"adjclose"`
 				} `json:"adjclose"`
 			} `json:"indicators"`
 		} `json:"result"`
@@ -211,32 +211,47 @@ func ValidateYahooResponse(data YahooResponse) error {
 	if len(result.Indicators.Quote) == 0 {
 		return fmt.Errorf("yahoo response has no quote")
 	}
-	if len(result.Indicators.AdjClose) == 0 {
-		return fmt.Errorf("yahoo response has no adjclose")
-	}
-
 	want := len(result.Timestamp)
 	quote := result.Indicators.Quote[0]
-	adjClose := result.Indicators.AdjClose[0]
-	lengths := []struct {
-		name string
-		got  int
+	prices := []struct {
+		name   string
+		values []*float64
 	}{
-		{name: "open", got: len(quote.Open)},
-		{name: "high", got: len(quote.High)},
-		{name: "low", got: len(quote.Low)},
-		{name: "close", got: len(quote.Close)},
-		{name: "volume", got: len(quote.Volume)},
-		{name: "adjclose", got: len(adjClose.Values)},
+		{name: "open", values: quote.Open},
+		{name: "high", values: quote.High},
+		{name: "low", values: quote.Low},
+		{name: "close", values: quote.Close},
 	}
-
-	for _, field := range lengths {
-		if field.got != want {
-			return fmt.Errorf("%s length is %d, timestamp length is %d", field.name, field.got, want)
+	for _, field := range prices {
+		if len(field.values) != want {
+			return fmt.Errorf("%s length is %d, timestamp length is %d", field.name, len(field.values), want)
+		}
+		for index, value := range field.values {
+			if value == nil || !positiveFinite(*value) {
+				return fmt.Errorf("missing or nonpositive %s for Yahoo bar %d", field.name, index)
+			}
+		}
+	}
+	if len(quote.Volume) != want {
+		return fmt.Errorf("volume length is %d, timestamp length is %d", len(quote.Volume), want)
+	}
+	for index, volume := range quote.Volume {
+		if volume == nil || *volume < 0 {
+			return fmt.Errorf("missing or negative volume for Yahoo bar %d", index)
+		}
+	}
+	if len(result.Indicators.AdjClose) > 0 {
+		values := result.Indicators.AdjClose[0].Values
+		if values != nil && len(values) != want {
+			return fmt.Errorf("adjclose length is %d, timestamp length is %d", len(values), want)
+		}
+		for index, value := range values {
+			if value != nil && !positiveFinite(*value) {
+				return fmt.Errorf("invalid adjclose for Yahoo bar %d: %v", index, *value)
+			}
 		}
 	}
 	return nil
-
 }
 
 // YahooResponse2Bars 把 Yahoo 响应转换为 K 线切片。
@@ -248,18 +263,26 @@ func YahooResponse2Bars(response YahooResponse) ([]Bar, error) {
 
 	result := response.Chart.Result[0]
 	quote := result.Indicators.Quote[0]
-	adjClose := result.Indicators.AdjClose[0]
+	var adjustedCloses []*float64
+	if len(result.Indicators.AdjClose) > 0 {
+		adjustedCloses = result.Indicators.AdjClose[0].Values
+	}
 
 	bars := make([]Bar, 0, len(result.Timestamp))
 	for i, timestamp := range result.Timestamp {
+		var adjustedClose float64
+		if adjustedCloses != nil && adjustedCloses[i] != nil {
+			adjustedClose = *adjustedCloses[i]
+		}
 		bars = append(bars, Bar{
-			Time:     time.Unix(timestamp, 0).UTC(),
-			Open:     quote.Open[i],
-			High:     quote.High[i],
-			Low:      quote.Low[i],
-			Close:    quote.Close[i],
-			AdjClose: adjClose.Values[i],
-			Volume:   quote.Volume[i],
+			Time:       time.Unix(timestamp, 0).UTC(),
+			Open:       *quote.Open[i],
+			High:       *quote.High[i],
+			Low:        *quote.Low[i],
+			Close:      *quote.Close[i],
+			AdjClose:   adjustedClose,
+			Volume:     *quote.Volume[i],
+			PriceBasis: PriceSplitAdjusted,
 		})
 	}
 	return bars, nil
@@ -275,26 +298,31 @@ func YahooResponse2TradingDays(response YahooResponse) ([]TradingDay, error) {
 	result := response.Chart.Result[0]
 	location := yahooExchangeLocation(result.Meta.TimezoneName, result.Meta.Timezone, result.Meta.GMTOffset)
 
-	tradingDays := make([]TradingDay, 0, len(result.Meta.TradingPeriods))
+	byDate := make(map[time.Time][]TradeSession, len(result.Meta.TradingPeriods))
 	for _, periods := range result.Meta.TradingPeriods {
-		if len(periods) == 0 {
-			continue
-		}
-		sessions := make([]TradeSession, 0, len(periods))
 		for _, period := range periods {
-			sessions = append(sessions, TradeSession{
-				Open:  time.Unix(period.Start, 0).In(location),
+			if period.End <= period.Start {
+				return nil, fmt.Errorf("invalid Yahoo trading session: start %d, end %d", period.Start, period.End)
+			}
+			open := time.Unix(period.Start, 0).In(location)
+			date := time.Date(open.Year(), open.Month(), open.Day(), 0, 0, 0, 0, location)
+			byDate[date] = append(byDate[date], TradeSession{
+				Open:  open,
 				Close: time.Unix(period.End, 0).In(location),
 			})
 		}
-		marketOpen := sessions[0].Open
+	}
+	tradingDays := make([]TradingDay, 0, len(byDate))
+	for date, sessions := range byDate {
+		slices.SortFunc(sessions, func(a, b TradeSession) int { return a.Open.Compare(b.Open) })
 		tradingDays = append(tradingDays, TradingDay{
-			Date:         time.Date(marketOpen.Year(), marketOpen.Month(), marketOpen.Day(), 0, 0, 0, 0, location),
+			Date:         date,
 			Exchange:     result.Meta.ExchangeName,
 			IsTradingDay: true,
 			Sessions:     sessions,
 		})
 	}
+	slices.SortFunc(tradingDays, func(a, b TradingDay) int { return a.Date.Compare(b.Date) })
 	return tradingDays, nil
 }
 
@@ -303,6 +331,7 @@ func YahooResponse2CorporateActions(response YahooResponse) ([]CorporateAction, 
 		return nil, fmt.Errorf("yahoo response has no result")
 	}
 	result := response.Chart.Result[0]
+	location := yahooExchangeLocation(result.Meta.TimezoneName, result.Meta.Timezone, result.Meta.GMTOffset)
 	event := result.Event
 	actions := make([]CorporateAction, 0, len(event.Dividends)+len(event.Splits))
 	for _, action := range event.Dividends {
@@ -311,7 +340,7 @@ func YahooResponse2CorporateActions(response YahooResponse) ([]CorporateAction, 
 		temp := CorporateAction{
 			Symbol:       result.Meta.Symbol,
 			Type:         CorporateActionType(actionName),
-			Date:         time.Unix(action.Date, 0).UTC(),
+			Date:         time.Unix(action.Date, 0).In(location),
 			CashPerShare: action.Amount,
 			SplitRatio:   0,
 		}
@@ -330,7 +359,7 @@ func YahooResponse2CorporateActions(response YahooResponse) ([]CorporateAction, 
 		temp := CorporateAction{
 			Symbol:       result.Meta.Symbol,
 			Type:         CorporateActionType(actionName),
-			Date:         time.Unix(action.Date, 0).UTC(),
+			Date:         time.Unix(action.Date, 0).In(location),
 			CashPerShare: 0,
 			SplitRatio:   action.Numerator / action.Denominator,
 		}
@@ -347,8 +376,10 @@ func YahooResponse2CorporateActions(response YahooResponse) ([]CorporateAction, 
 // yahooExchangeLocation 优先使用 IANA 时区名（能正确处理历史夏令时）；
 // 名称不可用时回退到按 GMT 偏移构造的固定时区。
 func yahooExchangeLocation(timezoneName, timezoneAbbrev string, gmtOffset int64) *time.Location {
-	if location, err := time.LoadLocation(timezoneName); err == nil {
-		return location
+	if timezoneName != "" {
+		if location, err := time.LoadLocation(timezoneName); err == nil {
+			return location
+		}
 	}
 	return time.FixedZone(timezoneAbbrev, int(gmtOffset))
 }
@@ -388,6 +419,10 @@ func (y *YahooResponse) Symbols() (SymbolInfo, error) {
 	}
 	result := y.Chart.Result[0]
 	meta := result.Meta
+	timezone := meta.TimezoneName
+	if timezone == "" {
+		timezone = meta.Timezone
+	}
 	var assetType AssetType
 	if meta.AssetType == "EQUITY" {
 		assetType = AssetStock
@@ -402,30 +437,22 @@ func (y *YahooResponse) Symbols() (SymbolInfo, error) {
 		AssetType:  assetType,
 		ListDate:   time.Unix(meta.FirstTradeDate, 0).UTC(),
 		DelistDate: nil,
-		Timezone:   meta.Timezone,
+		Timezone:   timezone,
 		LotSize:    -1,
 		TickSize:   -1,
 		ISIN:       "",
 	}, nil
 }
 
-// Calendar 生成交易日日历
+// Calendar uses Yahoo's exchange sessions. Quote timestamps cannot establish
+// which days the exchange opened but quotes for this symbol are missing.
 func (y *YahooResponse) Calendar() ([]TradingDay, error) {
-	if len(y.Chart.Result) == 0 {
-		return nil, fmt.Errorf("yahoo response has no result")
+	days, err := YahooResponse2TradingDays(*y)
+	if err != nil {
+		return nil, err
 	}
-	result := y.Chart.Result[0]
-	timestamps := y.Chart.Result[0].Timestamp
-	tradingDays := make([]TradingDay, 0, len(timestamps))
-	for _, timestamp := range timestamps {
-		temp := TradingDay{
-			Date:         time.Unix(timestamp, 0).UTC(),
-			Exchange:     result.Meta.ExchangeName,
-			IsTradingDay: true,
-			Sessions:     nil,
-			HolidayName:  "",
-		}
-		tradingDays = append(tradingDays, temp)
+	if len(days) == 0 {
+		return nil, fmt.Errorf("Yahoo trading calendar is unavailable without exchange sessions")
 	}
-	return tradingDays, nil
+	return days, nil
 }

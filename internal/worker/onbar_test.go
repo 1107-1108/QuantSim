@@ -17,7 +17,6 @@ import (
 	"time"
 )
 
-const onBarTestSocket = "/tmp/worker.socket"
 const onBarTestTimeout = 3 * time.Second
 
 func TestOnBarOK(t *testing.T) {
@@ -89,7 +88,7 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bar := onBarTestBar(7)
 			tc.invalidate(&bar)
-			_, wait := startOnBarTest(t, t.Context(), bar)
+			peer, wait := startOnBarTest(t, t.Context(), bar)
 			orders, err := wait()
 			if tc.want != "" {
 				assertOnBarError(t, err, tc.want)
@@ -102,6 +101,7 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 			if len(orders) != 0 {
 				t.Errorf("invalid input produced orders: %+v", orders)
 			}
+			assertNoNextBar(t, peer)
 		})
 	}
 }
@@ -109,9 +109,10 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 func TestOnBarRejectsOversizedRequest(t *testing.T) {
 	bar := onBarTestBar(7)
 	bar.Symbol = strings.Repeat("A", 16<<20)
-	_, wait := startOnBarTest(t, t.Context(), bar)
+	peer, wait := startOnBarTest(t, t.Context(), bar)
 	_, err := wait()
 	assertOnBarError(t, err, "exceeds")
+	assertNoNextBar(t, peer)
 }
 
 func TestOnBarReturnsWriteError(t *testing.T) {
@@ -197,10 +198,12 @@ func TestOnBarRejectsInvalidResponses(t *testing.T) {
 func TestOnBarHonorsContext(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
+		readHeader bool
 		readBar    bool
 		cancelRead bool
 	}{
 		{name: "blocked write"},
+		{name: "partial write", readHeader: true},
 		{name: "no response", readBar: true},
 		{name: "canceled while waiting for response", readBar: true, cancelRead: true},
 	} {
@@ -215,6 +218,12 @@ func TestOnBarHonorsContext(t *testing.T) {
 			defer cancel()
 
 			peer, wait := startOnBarTest(t, ctx, onBarTestBar(7))
+			if tc.readHeader {
+				var header [4]byte
+				if _, err := io.ReadFull(peer, header[:]); err != nil {
+					t.Fatalf("read partial request: %v", err)
+				}
+			}
 			if tc.readBar {
 				assertOnBarRequest(t, peer, 7)
 			}
@@ -233,11 +242,62 @@ func TestOnBarHonorsContext(t *testing.T) {
 			if len(orders) != 0 {
 				t.Errorf("OnBar returned orders without a response: %+v", orders)
 			}
+			assertOnBarPeerClosed(t, peer)
 		})
 	}
 }
 
+func TestOnBarCannotReuseConnectionAfterTimeout(t *testing.T) {
+	conn, peer := onBarTestPipe(t)
+	session := &Session{}
+	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	wait := callOnBar(t, ctx, session, conn, onBarTestBar(7))
+	assertOnBarRequest(t, peer, 7)
+	if _, err := wait(); !isWorkerTimeout(err) {
+		t.Fatalf("OnBar error = %v, want a timeout", err)
+	}
+
+	retryCtx, cancelRetry := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancelRetry()
+	if _, err := session.OnBar(retryCtx, conn, onBarTestBar(8)); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("OnBar on the timed-out connection returned %v, want a closed pipe", err)
+	}
+}
+
+func TestOnBarClosesConnectionAfterUnexpectedSequence(t *testing.T) {
+	peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(7))
+	assertOnBarRequest(t, peer, 7)
+	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":8,"condition":"OK"}`)))
+	_, err := wait()
+	assertOnBarError(t, err, "sequence mismatch")
+	assertOnBarPeerClosed(t, peer)
+}
+
+func TestOnBarCanReuseConnectionAfterWorkerError(t *testing.T) {
+	conn, peer := onBarTestPipe(t)
+	session := &Session{}
+	wait := callOnBar(t, t.Context(), session, conn, onBarTestBar(7))
+	assertOnBarRequest(t, peer, 7)
+	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":7,"condition":"ERROR"}`)))
+	_, err := wait()
+	assertOnBarError(t, err, "worker error at sequence 7")
+
+	wait = callOnBar(t, t.Context(), session, conn, onBarTestBar(8))
+	assertOnBarRequest(t, peer, 8)
+	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":8,"condition":"OK"}`)))
+	if _, err := wait(); err != nil {
+		t.Fatalf("OnBar after worker error: %v", err)
+	}
+}
+
 func startOnBarTest(t *testing.T, ctx context.Context, bar BarMsg) (net.Conn, func() ([]OrderMsg, error)) {
+	t.Helper()
+	conn, peer := onBarTestPipe(t)
+	return peer, callOnBar(t, ctx, &Session{}, conn, bar)
+}
+
+func onBarTestPipe(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
 	conn, peer := net.Pipe()
 	t.Cleanup(func() {
@@ -247,19 +307,22 @@ func startOnBarTest(t *testing.T, ctx context.Context, bar BarMsg) (net.Conn, fu
 	if err := peer.SetDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
 		t.Fatal(err)
 	}
+	return conn, peer
+}
 
+func callOnBar(t *testing.T, ctx context.Context, session *Session, conn net.Conn, bar BarMsg) func() ([]OrderMsg, error) {
+	t.Helper()
 	type result struct {
 		orders []OrderMsg
 		err    error
 	}
 
-	session := &Session{}
 	done := make(chan result, 1)
 	go func() {
 		orders, err := session.OnBar(ctx, conn, bar)
 		done <- result{orders: orders, err: err}
 	}()
-	wait := func() ([]OrderMsg, error) {
+	return func() ([]OrderMsg, error) {
 		t.Helper()
 		select {
 		case result := <-done:
@@ -269,7 +332,6 @@ func startOnBarTest(t *testing.T, ctx context.Context, bar BarMsg) (net.Conn, fu
 			return nil, nil
 		}
 	}
-	return peer, wait
 }
 
 func onBarTestBar(seq uint64) BarMsg {
@@ -341,6 +403,17 @@ func assertNoNextBar(t *testing.T, peer net.Conn) {
 	}
 	if err := peer.SetReadDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
 		t.Fatalf("reset read deadline: %v", err)
+	}
+}
+
+func assertOnBarPeerClosed(t *testing.T, peer net.Conn) {
+	t.Helper()
+	if err := peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var next [1]byte
+	if n, err := peer.Read(next[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("expected a closed connection, read %d bytes with %v", n, err)
 	}
 }
 

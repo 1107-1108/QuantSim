@@ -3,6 +3,7 @@ package storage
 import (
 	"FinanceSimulator/datasource"
 	"context"
+	"database/sql"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -170,6 +171,9 @@ func TestMetaTradingDays(t *testing.T) {
 func TestMetaCorporateActions(t *testing.T) {
 	store := openTestMetaStore(t)
 	context := context.Background()
+	if err := store.UpsertSymbol(context, datasource.SymbolInfo{Symbol: "AAPL", Timezone: "America/New_York"}); err != nil {
+		t.Fatalf("UpsertSymbol: %v", err)
+	}
 	dividend := datasource.CorporateAction{
 		Symbol:       "AAPL",
 		Type:         datasource.ActionDividend,
@@ -183,12 +187,16 @@ func TestMetaCorporateActions(t *testing.T) {
 		SplitRatio: 4,
 	}
 
-	if err := store.UpsertCorporateActions(context, "yahoo", []datasource.CorporateAction{split, dividend}); err != nil {
+	if err := store.UpsertCorporateActions(context, "manual", []datasource.CorporateAction{split, dividend}); err != nil {
 		t.Fatalf("UpsertCorporateActions: %v", err)
 	}
-	if err := store.UpsertCorporateActions(context, "manual", []datasource.CorporateAction{dividend}); err != nil {
+	updatedDividend := dividend
+	updatedDividend.Date = time.Date(2024, 2, 9, 14, 30, 0, 0, time.UTC)
+	updatedDividend.CashPerShare = 0.25
+	if err := store.UpsertCorporateActions(context, "yahoo", []datasource.CorporateAction{updatedDividend}); err != nil {
 		t.Fatalf("update UpsertCorporateActions: %v", err)
 	}
+	dividend.CashPerShare = 0.25
 
 	actions, err := store.ListCorporateActions(
 		context,
@@ -200,11 +208,106 @@ func TestMetaCorporateActions(t *testing.T) {
 		t.Fatalf("ListCorporateActions: %v", err)
 	}
 	want := []StoredCorporateAction{
-		{CorporateAction: dividend, Source: "manual"},
-		{CorporateAction: split, Source: "yahoo"},
+		{CorporateAction: dividend, Source: "yahoo"},
+		{CorporateAction: split, Source: "manual"},
 	}
 	if !reflect.DeepEqual(actions, want) {
 		t.Errorf("ListCorporateActions = %#v, want %#v", actions, want)
+	}
+}
+
+func TestMetaCorporateActionsUseExchangeDateAcrossUTCMidnight(t *testing.T) {
+	store := openTestMetaStore(t)
+	ctx := context.Background()
+	const symbol = "7203.T"
+	if err := store.UpsertSymbol(ctx, datasource.SymbolInfo{Symbol: symbol, Timezone: "Asia/Tokyo"}); err != nil {
+		t.Fatalf("UpsertSymbol: %v", err)
+	}
+	dividend := datasource.CorporateAction{
+		Symbol: symbol, Type: datasource.ActionDividend, CashPerShare: 25,
+		Date: time.Date(2024, 6, 10, 0, 0, 0, 0, time.UTC),
+	}
+	if err := store.UpsertCorporateActions(ctx, "manual", []datasource.CorporateAction{dividend}); err != nil {
+		t.Fatalf("insert date-only dividend: %v", err)
+	}
+	previousDay := datasource.CorporateAction{
+		Symbol: symbol, Type: datasource.ActionDividend, CashPerShare: 20,
+		Date: time.Date(2024, 6, 9, 14, 30, 0, 0, time.UTC), // June 9 at 23:30 in Tokyo.
+	}
+	updatedDividend := datasource.CorporateAction{
+		Symbol: symbol, Type: datasource.ActionDividend, CashPerShare: 30,
+		Date: time.Date(2024, 6, 9, 15, 30, 0, 0, time.UTC), // June 10 at 00:30 in Tokyo.
+	}
+	if err := store.UpsertCorporateActions(ctx, "feed", []datasource.CorporateAction{previousDay, updatedDividend}); err != nil {
+		t.Fatalf("insert timed dividends: %v", err)
+	}
+	got, err := store.ListCorporateActions(ctx, symbol, dividend.Date.AddDate(0, 0, -1), dividend.Date.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatalf("ListCorporateActions: %v", err)
+	}
+	dividend.CashPerShare = 30
+	want := []StoredCorporateAction{
+		{CorporateAction: previousDay, Source: "feed"},
+		{CorporateAction: dividend, Source: "feed"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ListCorporateActions = %#v, want %#v", got, want)
+	}
+}
+
+func TestMetaCorporateActionsMigrateExistingExchangeDates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.db")
+	legacy, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	t.Cleanup(func() { legacy.Close() })
+	if _, err := legacy.Exec(`
+		CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+		INSERT INTO schema_migrations VALUES (1);
+	` + metadataSchemaV1 + `
+		INSERT INTO symbols(symbol, name, exchange, currency, asset_type, timezone, lot_size, tick_size, isin)
+		VALUES ('7203.T', 'Toyota', 'JPX', 'JPY', 'STOCK', 'Asia/Tokyo', 100, 1, '');
+	`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	const symbol = "7203.T"
+	const insert = `INSERT INTO corporate_actions(symbol, action_type, ex_date, cash_per_share, split_ratio, source)
+		VALUES (?, ?, ?, ?, ?, ?)`
+	exDate := time.Date(2024, 6, 10, 0, 0, 0, 0, time.UTC)
+	previousDay := time.Date(2024, 6, 9, 14, 30, 0, 0, time.UTC)
+	for _, action := range []StoredCorporateAction{
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionDividend, Date: exDate, CashPerShare: 25}, Source: "manual"},
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionDividend, Date: previousDay, CashPerShare: 20}, Source: "feed"},
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionDividend, Date: time.Date(2024, 6, 9, 15, 30, 0, 0, time.UTC), CashPerShare: 30}, Source: "feed"},
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionSplit, Date: exDate, SplitRatio: 2}, Source: "manual"},
+	} {
+		if _, err := legacy.Exec(insert, action.Symbol, action.Type, action.Date.UnixMicro(), action.CashPerShare, action.SplitRatio, action.Source); err != nil {
+			t.Fatalf("insert legacy action: %v", err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	store, err := OpenMetaStore(path)
+	if err != nil {
+		t.Fatalf("open and migrate legacy database: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+	from, to := exDate.AddDate(0, 0, -1), exDate.AddDate(0, 0, 1)
+	got, err := store.ListCorporateActions(ctx, symbol, from, to)
+	if err != nil {
+		t.Fatalf("ListCorporateActions: %v", err)
+	}
+	want := []StoredCorporateAction{
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionDividend, Date: previousDay, CashPerShare: 20}, Source: "feed"},
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionDividend, Date: exDate, CashPerShare: 30}, Source: "feed"},
+		{CorporateAction: datasource.CorporateAction{Symbol: symbol, Type: datasource.ActionSplit, Date: exDate, SplitRatio: 2}, Source: "manual"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("migrated actions = %#v, want %#v", got, want)
 	}
 }
 

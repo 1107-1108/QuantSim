@@ -78,6 +78,45 @@ func TestQualitySplitRatio(t *testing.T) {
 	}
 }
 
+func TestQualityUsesSplitAdjustedPriceBasis(t *testing.T) {
+	start := time.Date(2020, 8, 28, 13, 30, 0, 0, time.UTC)
+	end := start.AddDate(0, 0, 3)
+	bars := []datasource.Bar{validQualityBar(start, 124.81), validQualityBar(end, 129.04)}
+	for i := range bars {
+		bars[i].PriceBasis = datasource.PriceSplitAdjusted
+	}
+	actions := []datasource.CorporateAction{{Type: datasource.ActionSplit, Date: end, SplitRatio: 4}}
+	if issues := ValidateMarketData(bars, actions, nil); len(issues) != 0 {
+		t.Fatalf("issues = %+v, want no split price mismatch for adjusted quotes", issues)
+	}
+}
+
+func TestQualityMissingDaysUsesExchangeDate(t *testing.T) {
+	sydney, err := time.LoadLocation("Australia/Sydney")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2024, 1, 2, 0, 0, 0, 0, sydney)
+	var calendar []datasource.TradingDay
+	for offset := range 8 {
+		day := first.AddDate(0, 0, offset)
+		calendar = append(calendar, datasource.TradingDay{
+			Date:         day.UTC(), // MetaStore returns stored instants in UTC.
+			IsTradingDay: true,
+			Sessions:     []datasource.TradeSession{{Open: day.Add(10 * time.Hour), Close: day.Add(16 * time.Hour)}},
+		})
+	}
+	bars := []datasource.Bar{
+		validQualityBar(calendar[0].Sessions[0].Open.UTC(), 10),
+		validQualityBar(calendar[7].Sessions[0].Open.UTC(), 10),
+	}
+	issues := ValidateMarketData(bars, nil, calendar)
+	if len(issues) != 1 || issues[0].Code != QualityIssueMissingTradingDays ||
+		!issues[0].Time.Equal(first.AddDate(0, 0, 1)) {
+		t.Fatalf("issues = %+v, want Jan 3 as the first missing exchange date", issues)
+	}
+}
+
 // TestQualityAbnormalMove 验证超过百分之五十的普通日间波动会生成警告。
 func TestQualityAbnormalMove(t *testing.T) {
 	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -108,6 +147,24 @@ func TestQualityAbnormalMoveOnSplit(t *testing.T) {
 	issues := ValidateMarketData(bars, actions, nil)
 	if containsQualityIssue(issues, QualityIssueAbnormalPriceMove, QualitySeverityWarning) {
 		t.Errorf("issues = %#v, do not want abnormal price move warning on a split date", issues)
+	}
+}
+
+func TestQualityMatchesSplitInstantAcrossTimezones(t *testing.T) {
+	sydney, err := time.LoadLocation("Australia/Sydney")
+	if err != nil {
+		t.Fatal(err)
+	}
+	splitTime := time.Date(2024, 1, 3, 10, 0, 0, 0, sydney)
+	bars := []datasource.Bar{
+		validQualityBar(splitTime.AddDate(0, 0, -1).UTC(), 300),
+		validQualityBar(splitTime.UTC(), 100),
+	}
+	actions := []datasource.CorporateAction{{
+		Type: datasource.ActionSplit, Date: splitTime, SplitRatio: 3,
+	}}
+	if issues := ValidateMarketData(bars, actions, nil); len(issues) != 0 {
+		t.Fatalf("issues = %+v, want no unexplained price move across a known split", issues)
 	}
 }
 

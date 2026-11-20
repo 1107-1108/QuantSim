@@ -10,7 +10,7 @@ var (
 	// 所以出现这个错说明上游校验漏了,属于 bug。
 	ErrOversell = errors.New("sell quantity exceeds position")
 
-	// ErrNegativeCash 买入成交后现金为负。同样属于上游购买力校验漏了的 bug。
+	// ErrNegativeCash 成交后现金不足以支付买入成本或卖出费用。
 	ErrNegativeCash = errors.New("negative cash after fill")
 
 	// ErrInvalidFill 成交记录本身非法:空 symbol、非法方向、数量/价格非正、

@@ -15,8 +15,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const metadataSchemaVersion = 1
-
 // MetaStore 管理 SQLite 中的业务元数据与在线状态。
 // M1 只包含行情元数据和导入记录，不包含回测或 paper trading 的 repository。
 type MetaStore struct {
@@ -274,26 +272,32 @@ func (store *MetaStore) UpsertCorporateActions(ctx context.Context, source strin
 	}
 	defer transaction.Rollback()
 
-	statement, err := transaction.PrepareContext(ctx, `
-		INSERT INTO corporate_actions(
-			symbol, action_type, ex_date, cash_per_share, split_ratio, source
-		) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(symbol, ex_date, action_type) DO UPDATE SET
-			cash_per_share = excluded.cash_per_share,
-			split_ratio = excluded.split_ratio,
-			source = excluded.source
-	`)
+	statement, err := transaction.PrepareContext(ctx, upsertCorporateAction)
 	if err != nil {
 		return fmt.Errorf("prepare corporate action upsert: %w", err)
 	}
 	defer statement.Close()
 
+	locations := make(map[string]*time.Location)
 	for _, action := range actions {
+		location, loaded := locations[action.Symbol]
+		if !loaded {
+			var timezone string
+			if err := transaction.QueryRowContext(ctx, `
+				SELECT COALESCE((SELECT timezone FROM symbols WHERE symbol = ?), '')
+			`, action.Symbol).Scan(&timezone); err != nil {
+				return fmt.Errorf("lookup timezone for %q: %w", action.Symbol, err)
+			}
+			location = corporateActionLocation(timezone)
+			locations[action.Symbol] = location
+		}
 		if _, err := statement.ExecContext(
 			ctx,
+			nil,
 			action.Symbol,
 			string(action.Type),
 			action.Date.UTC().UnixMicro(),
+			corporateActionDay(action.Date, location),
 			action.CashPerShare,
 			action.SplitRatio,
 			source,
@@ -306,6 +310,33 @@ func (store *MetaStore) UpsertCorporateActions(ctx context.Context, source strin
 		return fmt.Errorf("commit corporate action transaction: %w", err)
 	}
 	return nil
+}
+
+const upsertCorporateAction = `
+INSERT INTO corporate_actions(id, symbol, action_type, ex_date, ex_day, cash_per_share, split_ratio, source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(symbol, ex_day, action_type) DO UPDATE SET
+	cash_per_share = excluded.cash_per_share,
+	split_ratio = excluded.split_ratio,
+	source = excluded.source
+`
+
+func corporateActionLocation(timezone string) *time.Location {
+	if timezone == "" || timezone == "Local" {
+		return nil
+	}
+	location, _ := time.LoadLocation(timezone)
+	return location
+}
+
+func corporateActionDay(date time.Time, location *time.Location) string {
+	// Midnight UTC can represent a date-only input, such as a manual ex-date.
+	_, offset := date.Zone()
+	dateOnly := offset == 0 && date.Equal(date.Truncate(24*time.Hour))
+	if location != nil && !dateOnly {
+		date = date.In(location)
+	}
+	return date.Format(time.DateOnly)
 }
 
 // ListCorporateActions 返回 [from, to) 范围内指定证券按除息日升序排列的公司行为。
@@ -481,7 +512,7 @@ func timePointerFromNullableValue(value sql.NullInt64) *time.Time {
 	return &timestamp
 }
 
-// configureAndMigrate 配置本地 SQLite 连接并应用首个元数据 schema migration。
+// configureAndMigrate 配置本地 SQLite 连接并应用未执行的元数据 schema migration。
 func (store *MetaStore) configureAndMigrate() error {
 	for _, statement := range []string{
 		"PRAGMA foreign_keys = ON",
@@ -507,22 +538,33 @@ func (store *MetaStore) configureAndMigrate() error {
 		return fmt.Errorf("create migration table: %w", err)
 	}
 
-	var applied bool
-	if err := transaction.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?)",
-		metadataSchemaVersion,
-	).Scan(&applied); err != nil {
-		return fmt.Errorf("query SQLite migration: %w", err)
+	migrations := []func(*sql.Tx) error{
+		func(transaction *sql.Tx) error {
+			_, err := transaction.Exec(metadataSchemaV1)
+			return err
+		},
+		migrateCorporateActionDates,
 	}
-	if !applied {
-		if _, err := transaction.Exec(metadataSchemaV1); err != nil {
-			return fmt.Errorf("apply SQLite migration %d: %w", metadataSchemaVersion, err)
+	for index, migrate := range migrations {
+		version := index + 1
+		var applied bool
+		if err := transaction.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?)",
+			version,
+		).Scan(&applied); err != nil {
+			return fmt.Errorf("query SQLite migration %d: %w", version, err)
+		}
+		if applied {
+			continue
+		}
+		if err := migrate(transaction); err != nil {
+			return fmt.Errorf("apply SQLite migration %d: %w", version, err)
 		}
 		if _, err := transaction.Exec(
 			"INSERT INTO schema_migrations(version) VALUES (?)",
-			metadataSchemaVersion,
+			version,
 		); err != nil {
-			return fmt.Errorf("record SQLite migration %d: %w", metadataSchemaVersion, err)
+			return fmt.Errorf("record SQLite migration %d: %w", version, err)
 		}
 	}
 
@@ -584,6 +626,72 @@ CREATE INDEX corporate_actions_symbol_ex_date_idx
 CREATE INDEX import_runs_symbol_timeframe_range_idx
 	ON import_runs(symbol, timeframe, from_time, to_time);
 `
+
+func migrateCorporateActionDates(transaction *sql.Tx) error {
+	if _, err := transaction.Exec(`
+		ALTER TABLE corporate_actions RENAME TO corporate_actions_v1;
+		CREATE TABLE corporate_actions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			symbol TEXT NOT NULL,
+			action_type TEXT NOT NULL,
+			ex_date INTEGER NOT NULL,
+			ex_day TEXT NOT NULL,
+			cash_per_share REAL NOT NULL,
+			split_ratio REAL NOT NULL,
+			source TEXT NOT NULL,
+			UNIQUE(symbol, ex_day, action_type)
+		);
+	`); err != nil {
+		return err
+	}
+
+	rows, err := transaction.Query(`
+		SELECT a.id, a.symbol, a.action_type, a.ex_date, a.cash_per_share, a.split_ratio, a.source,
+			COALESCE(s.timezone, '')
+		FROM corporate_actions_v1 a
+		LEFT JOIN symbols s ON s.symbol = a.symbol
+		ORDER BY a.id
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	statement, err := transaction.Prepare(upsertCorporateAction)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+
+	locations := make(map[string]*time.Location)
+	// Process rows in insertion order so duplicates keep the first stored
+	// timestamp and take the values and source from the highest row ID.
+	for rows.Next() {
+		var id, date int64
+		var symbol, actionType, source, timezone string
+		var cash, ratio float64
+		if err := rows.Scan(&id, &symbol, &actionType, &date, &cash, &ratio, &source, &timezone); err != nil {
+			return err
+		}
+		location, loaded := locations[timezone]
+		if !loaded {
+			location = corporateActionLocation(timezone)
+			locations[timezone] = location
+		}
+		exDay := corporateActionDay(time.UnixMicro(date).UTC(), location)
+		if _, err := statement.Exec(id, symbol, actionType, date, exDay, cash, ratio, source); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = transaction.Exec(`
+		DROP TABLE corporate_actions_v1;
+		CREATE INDEX corporate_actions_symbol_ex_date_idx ON corporate_actions(symbol, ex_date);
+	`)
+	return err
+}
 
 // TestDBConn 检查固定测试路径上的 SQLite 数据库是否可以建立连接。
 func TestDBConn() error {

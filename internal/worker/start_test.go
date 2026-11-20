@@ -9,10 +9,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+const legacyWorkerSocket = "/tmp/worker.socket"
 
 func TestStartEmptyInput(t *testing.T) {
 	for _, tc := range []struct {
@@ -36,28 +39,111 @@ class Strategy:
 	}
 }
 
-func TestStartSocketAlreadyExists(t *testing.T) {
-	file, err := os.OpenFile(onBarTestSocket, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+func TestStartIgnoresExistingLegacySocketPath(t *testing.T) {
+	file, err := os.OpenFile(legacyWorkerSocket, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err == nil {
+		t.Cleanup(func() {
+			if err := os.Remove(legacyWorkerSocket); err != nil {
+				t.Error(err)
+			}
+		})
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	} else if !errors.Is(err, os.ErrExist) {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(legacyWorkerSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := os.Remove(onBarTestSocket); err != nil {
-			t.Error(err)
+
+	session := useTestPythonWorker(t, `
+class Strategy:
+    def on_bar(self, bar):
+        return []
+`)
+	if err := runTestPythonWorker(t, session, []BarMsg{onBarTestBar(7)}, onBarTestTimeout); err != nil {
+		t.Fatalf("Start with the legacy path occupied: %v", err)
+	}
+	after, err := os.Lstat(legacyWorkerSocket)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("Start disturbed the existing legacy path: %v", err)
+	}
+}
+
+func TestStartRunsIndependentSessionsConcurrently(t *testing.T) {
+	readyDir := t.TempDir()
+	strategy := `
+from pathlib import Path
+import time
+
+class Strategy:
+    def on_bar(self, bar):
+        ready = Path(` + strconv.Quote(readyDir) + `)
+        seq = bar["seq"]
+        (ready / str(seq)).touch()
+        other_seq = 8 if seq == 7 else 7
+        while not (ready / str(other_seq)).exists():
+            time.sleep(0.01)
+        return [{"symbol": bar["symbol"], "side": "BUY", "type": "MARKET", "qty": seq}]
+`
+	first, second := useTestPythonWorker(t, strategy), useTestPythonWorker(t, strategy)
+	ctx, cancel := context.WithTimeout(t.Context(), onBarTestTimeout)
+	defer cancel()
+	done := make(chan error, 2)
+	go func() { done <- first.Start(ctx, []BarMsg{onBarTestBar(7)}) }()
+	go func() { done <- second.Start(ctx, []BarMsg{onBarTestBar(8)}) }()
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Errorf("concurrent Start: %v", err)
+			cancel()
 		}
-	})
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
+	}
+	if t.Failed() {
+		return
+	}
+	firstPath := assertTestSocketCleanedUp(t, first.ScriptPath)
+	secondPath := assertTestSocketCleanedUp(t, second.ScriptPath)
+	if filepath.Dir(firstPath) == filepath.Dir(secondPath) {
+		t.Errorf("sessions shared a socket directory: %s", filepath.Dir(firstPath))
+	}
+	wantFirst := []OrderMsg{{Symbol: "AAPL", Side: "BUY", Type: "MARKET", Qty: 7}}
+	wantSecond := []OrderMsg{{Symbol: "AAPL", Side: "BUY", Type: "MARKET", Qty: 8}}
+	if !reflect.DeepEqual(first.orderList, wantFirst) || !reflect.DeepEqual(second.orderList, wantSecond) {
+		t.Errorf("orders = %+v and %+v, want %+v and %+v", first.orderList, second.orderList, wantFirst, wantSecond)
+	}
+}
+
+func TestStartRejectsOverlappingCallsOnSameSession(t *testing.T) {
+	session := useTestPythonWorker(t, "import time\ntime.sleep(30)")
+	ctx, cancel := context.WithTimeout(t.Context(), onBarTestTimeout)
+	done := make(chan error, 1)
+	go func() { done <- session.Start(ctx, nil) }()
+	defer func() {
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("first Start returned %v, want context.Canceled", err)
+		}
+	}()
+
+	pidPath := filepath.Join(filepath.Dir(session.ScriptPath), "worker.pid")
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(pidPath); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("first Start did not launch Python")
+		case <-ticker.C:
+		}
 	}
 
-	session := &Session{}
-	err = session.Start(t.Context(), []BarMsg{onBarTestBar(7)})
-	if !errors.Is(err, os.ErrExist) {
-		t.Fatalf("Start error = %v, want %v", err, os.ErrExist)
-	}
-	if _, err := os.Stat(onBarTestSocket); err != nil {
-		t.Fatalf("Start removed the existing file: %v", err)
-	}
+	assertOnBarError(t, session.Start(ctx, nil), "worker session is already running")
 }
 
 func TestStartLaunchesPythonAndCollectsOrders(t *testing.T) {
@@ -231,12 +317,18 @@ func useTestPythonWorker(t *testing.T, strategy string) *Session {
 			t.Fatal(err)
 		}
 	}
-	const recordPID = `import os
+	const recordWorker = `import os
+import sys
 with open("worker.pid", "w", encoding="ascii") as file:
     file.write(str(os.getpid()))
 
+socket_path = sys.argv[sys.argv.index("--socket") + 1]
+with open("worker.socket-info", "w", encoding="utf-8") as file:
+    print(socket_path, file=file)
+    print(oct(os.stat(os.path.dirname(socket_path)).st_mode & 0o777), file=file)
+
 `
-	if err := os.WriteFile(filepath.Join(dir, "strategy.py"), []byte(recordPID+strategy), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "strategy.py"), []byte(recordWorker+strategy), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PYTHONDONTWRITEBYTECODE", "1")
@@ -248,10 +340,6 @@ with open("worker.pid", "w", encoding="ascii") as file:
 
 func runTestPythonWorker(t *testing.T, session *Session, bars []BarMsg, maxWait time.Duration) error {
 	t.Helper()
-	if _, err := os.Lstat(onBarTestSocket); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("need an unused %s (stat error: %v)", onBarTestSocket, err)
-	}
-
 	ctx, cancel := context.WithTimeout(t.Context(), maxWait)
 	defer cancel()
 	done := make(chan error, 1)
@@ -261,9 +349,7 @@ func runTestPythonWorker(t *testing.T, session *Session, bars []BarMsg, maxWait 
 
 	select {
 	case err := <-done:
-		if _, statErr := os.Lstat(onBarTestSocket); !errors.Is(statErr, os.ErrNotExist) {
-			t.Errorf("socket was not cleaned up: %v", statErr)
-		}
+		assertTestSocketCleanedUp(t, session.ScriptPath)
 		if len(bars) > 0 {
 			assertTestPythonExited(t, session.ScriptPath)
 		}
@@ -275,6 +361,25 @@ func runTestPythonWorker(t *testing.T, session *Session, bars []BarMsg, maxWait 
 		t.Fatal("Start did not return after the caller's safety deadline")
 		return nil
 	}
+}
+
+func assertTestSocketCleanedUp(t *testing.T, script string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(script), "worker.socket-info"))
+	if err != nil {
+		t.Errorf("could not verify worker socket cleanup: %v", err)
+		return ""
+	}
+	path, mode, _ := strings.Cut(strings.TrimSuffix(string(data), "\n"), "\n")
+	if path == legacyWorkerSocket || mode != "0o700" {
+		t.Errorf("worker socket %q was not in a private session directory (mode %q)", path, mode)
+	}
+	for _, entry := range []string{path, filepath.Dir(path)} {
+		if _, err := os.Lstat(entry); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("worker socket entry %q was not cleaned up: %v", entry, err)
+		}
+	}
+	return path
 }
 
 func assertTestPythonExited(t *testing.T, script string) {

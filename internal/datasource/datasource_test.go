@@ -141,6 +141,35 @@ func decodeYahooResponse(t *testing.T, payload string) YahooResponse {
 }
 
 func TestYahooResponse2Bars(t *testing.T) {
+	t.Run("accepts complete quotes without adjusted closes", func(t *testing.T) {
+		for _, adjustment := range []string{``, `,"adjclose":[{}]`, `,"adjclose":[{"adjclose":[null]}]`} {
+			response := decodeYahooResponse(t, `{"chart":{"result":[{
+				"timestamp":[1704153600],
+				"indicators":{"quote":[{"open":[10],"high":[12],"low":[9],"close":[11],"volume":[0]}]`+adjustment+`}
+			}]}}`)
+			bars, err := YahooResponse2Bars(response)
+			if err != nil || len(bars) != 1 {
+				t.Fatalf("with optional fields %q got %v, %v, want one bar", adjustment, bars, err)
+			}
+			if bars[0].Close != 11 || bars[0].Volume != 0 || bars[0].AdjClose != 0 {
+				t.Fatalf("unexpected bar: %+v", bars[0])
+			}
+		}
+	})
+
+	t.Run("rejects a quote with missing required values", func(t *testing.T) {
+		response := decodeYahooResponse(t, `{"chart":{"result":[{
+			"timestamp":[1704153600,1704240000],
+			"indicators":{
+				"quote":[{"open":[10,null],"high":[12,null],"low":[9,null],"close":[11,null],"volume":[1,null]}],
+				"adjclose":[{"adjclose":[11,null]}]
+			}
+		}]}}`)
+		if bars, err := YahooResponse2Bars(response); bars != nil || err == nil || !strings.Contains(err.Error(), "open") {
+			t.Fatalf("got %v, %v, want an error for the missing open quote", bars, err)
+		}
+	})
+
 	t.Run("converts timestamps and quotes into bars", func(t *testing.T) {
 		// Arrange
 		payload := `{
@@ -175,6 +204,9 @@ func TestYahooResponse2Bars(t *testing.T) {
 			t.Fatalf("expected 2 bars, got %d", len(bars))
 		}
 		first := bars[0]
+		if first.PriceBasis != PriceSplitAdjusted {
+			t.Error("Yahoo quote OHLC must be identified as split-adjusted")
+		}
 		if !first.Time.Equal(time.Unix(1704153600, 0).UTC()) {
 			t.Errorf("Time: got %v, want %v", first.Time, time.Unix(1704153600, 0).UTC())
 		}
@@ -242,6 +274,48 @@ func TestYahooResponse2Bars(t *testing.T) {
 			t.Errorf("expected error to name the close field, got %q", err.Error())
 		}
 	})
+}
+
+func TestBarAsTraded(t *testing.T) {
+	quote := Bar{Open: 120, High: 125, Low: 119, Close: 124, AdjClose: 121, PriceBasis: PriceSplitAdjusted}
+	converted, err := quote.AsTraded(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted.PriceBasis != PriceAsTraded || converted.Open != 480 || converted.High != 500 ||
+		converted.Low != 476 || converted.Close != 496 || converted.AdjClose != 121 {
+		t.Errorf("unexpected as-traded bar: %+v", converted)
+	}
+	if _, err := quote.AsTraded(0); err == nil {
+		t.Error("expected an error for a zero split factor")
+	}
+	if _, err := converted.AsTraded(4); err == nil {
+		t.Error("expected an error when attempting to adjust an already as-traded bar")
+	}
+}
+
+func TestYahooCalendarUsesSessionsWithoutNeedingQuotesOnEveryDay(t *testing.T) {
+	response := decodeYahooResponse(t, `{"chart":{"result":[{
+		"meta":{"exchangeName":"ASX","exchangeTimezoneName":"Australia/Sydney",
+		"tradingPeriods":[[{"start":1704150000,"end":1704171600}],[{"start":1704236400,"end":1704258000}]]},
+		"timestamp":[1704150000,1704150060]
+	}]}}`)
+	days, err := response.Calendar()
+	if err != nil || len(days) != 2 {
+		t.Fatalf("got %v, %v, want two sessions on separate trading days", days, err)
+	}
+	for i, day := range days {
+		if day.Date.Day() != i+2 || day.Date.Hour() != 0 || len(day.Sessions) != 1 {
+			t.Errorf("day %d = %+v, want exchange-local midnight and one session", i, day)
+		}
+	}
+}
+
+func TestYahooCalendarRequiresSessionData(t *testing.T) {
+	response := decodeYahooResponse(t, `{"chart":{"result":[{"timestamp":[1704150000]}]}}`)
+	if days, err := response.Calendar(); days != nil || err == nil {
+		t.Fatalf("got %v, %v, want calendar unavailable without sessions", days, err)
+	}
 }
 
 func TestYahooResponse2TradingDays(t *testing.T) {

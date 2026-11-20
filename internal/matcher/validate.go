@@ -29,6 +29,12 @@ func validateOrder(order Order) error {
 // validateBar 行情边界校验。只查撮合实际用到的 OHL 三个价
 // (OHLC 一致性、缺口等数据质量规则是 datasource 校验器的职责,不在此重复)。
 func validateBar(bar datasource.Bar) error {
+	if bar.PriceBasis == datasource.PriceSplitAdjusted {
+		return fmt.Errorf("%w: convert split-adjusted OHLC to as-traded prices before matching", ErrInvalidBar)
+	}
+	if bar.PriceBasis != datasource.PriceAsTraded {
+		return fmt.Errorf("%w: OHLC price basis is unknown", ErrInvalidBar)
+	}
 	if !isPositiveFinite(bar.Open) || !isPositiveFinite(bar.High) || !isPositiveFinite(bar.Low) {
 		return fmt.Errorf("%w: OHL prices must be positive and finite, got O=%v H=%v L=%v",
 			ErrInvalidBar, bar.Open, bar.High, bar.Low)

@@ -90,10 +90,12 @@ func ValidateMarketData(
 	return issues
 }
 
-// validOHLC 判断一根 K 线的开高低收价格是否有限且关系正确。
+// validOHLC 判断一根 K 线的开高低收价格是否为有限正数且关系正确。
 func validOHLC(bar datasource.Bar) bool {
-	if !finitePrice(bar.Open) || !finitePrice(bar.High) || !finitePrice(bar.Low) || !finitePrice(bar.Close) {
-		return false
+	for _, price := range [...]float64{bar.Open, bar.High, bar.Low, bar.Close} {
+		if !finitePrice(price) || price <= 0 {
+			return false
+		}
 	}
 	return bar.High >= math.Max(bar.Open, bar.Close) &&
 		bar.Low <= math.Min(bar.Open, bar.Close) &&
@@ -112,12 +114,8 @@ func findMissingTradingDays(bars []datasource.Bar, calendar []datasource.Trading
 	}
 
 	sortedBars := sortedBars(bars)
-	firstDate := calendarDate(sortedBars[0].Time)
-	lastDate := calendarDate(sortedBars[len(sortedBars)-1].Time)
-	barDates := make(map[string]struct{}, len(bars))
-	for _, bar := range bars {
-		barDates[calendarDateKey(bar.Time)] = struct{}{}
-	}
+	firstBarTime := sortedBars[0].Time
+	lastBarTime := sortedBars[len(sortedBars)-1].Time
 
 	sortedCalendar := append([]datasource.TradingDay(nil), calendar...)
 	sort.Slice(sortedCalendar, func(left, right int) bool {
@@ -128,8 +126,12 @@ func findMissingTradingDays(bars []datasource.Bar, calendar []datasource.Trading
 	var missingStart time.Time
 	previousDateKey := ""
 	for _, day := range sortedCalendar {
-		dayDate := calendarDate(day.Date)
-		dayKey := calendarDateKey(dayDate)
+		dayTime := day.Date
+		if len(day.Sessions) > 0 {
+			dayTime = day.Sessions[0].Open
+		}
+		dayDate := time.Date(dayTime.Year(), dayTime.Month(), dayTime.Day(), 0, 0, 0, 0, dayTime.Location())
+		dayKey := dayDate.Format(time.DateOnly)
 		if dayKey == previousDateKey {
 			continue
 		}
@@ -137,12 +139,16 @@ func findMissingTradingDays(bars []datasource.Bar, calendar []datasource.Trading
 		if !day.IsTradingDay {
 			continue
 		}
-		if dayDate.Before(firstDate) || dayDate.After(lastDate) {
+		dayEnd := dayDate.AddDate(0, 0, 1)
+		if !dayEnd.After(firstBarTime) || dayDate.After(lastBarTime) {
 			issues = appendMissingTradingDaysIssue(issues, missingStart, missingCount)
 			missingCount = 0
 			continue
 		}
-		if _, found := barDates[dayKey]; found {
+		firstInDay := sort.Search(len(sortedBars), func(index int) bool {
+			return !sortedBars[index].Time.Before(dayDate)
+		})
+		if firstInDay < len(sortedBars) && sortedBars[firstInDay].Time.Before(dayEnd) {
 			issues = appendMissingTradingDaysIssue(issues, missingStart, missingCount)
 			missingCount = 0
 			continue
@@ -188,7 +194,20 @@ func findSplitPriceMismatches(bars []datasource.Bar, actions []datasource.Corpor
 		if !found || !finitePrice(preSplit.Close) || !finitePrice(postSplit.Close) || preSplit.Close == 0 {
 			continue
 		}
+		if preSplit.PriceBasis != postSplit.PriceBasis ||
+			(preSplit.PriceBasis != datasource.PriceAsTraded && preSplit.PriceBasis != datasource.PriceSplitAdjusted) {
+			issues = append(issues, DataQualityIssue{
+				Severity: QualitySeverityError,
+				Code:     QualityIssueSplitPriceMismatch,
+				Time:     action.Date,
+				Message:  "split price comparison requires a consistent, known OHLC basis",
+			})
+			continue
+		}
 		expectedRatio := 1 / action.SplitRatio
+		if preSplit.PriceBasis == datasource.PriceSplitAdjusted {
+			expectedRatio = 1
+		}
 		actualRatio := postSplit.Close / preSplit.Close
 		if math.Abs(actualRatio/expectedRatio-1) <= splitDeviationThreshold {
 			continue
@@ -226,12 +245,13 @@ func findAbnormalPriceMoves(bars []datasource.Bar, actions []datasource.Corporat
 	if len(dailyBars) < 2 {
 		return nil
 	}
-	splitDates := make(map[string]struct{})
+	var splitTimes []time.Time
 	for _, action := range actions {
 		if isSplitAction(action) {
-			splitDates[calendarDateKey(action.Date)] = struct{}{}
+			splitTimes = append(splitTimes, action.Date)
 		}
 	}
+	sort.Slice(splitTimes, func(i, j int) bool { return splitTimes[i].Before(splitTimes[j]) })
 
 	issues := make([]DataQualityIssue, 0)
 	for index := 1; index < len(dailyBars); index++ {
@@ -244,8 +264,13 @@ func findAbnormalPriceMoves(bars []datasource.Bar, actions []datasource.Corporat
 		if priceMove <= priceMoveThreshold {
 			continue
 		}
-		if _, isSplitDate := splitDates[calendarDateKey(current.Time)]; isSplitDate {
-			continue
+		if previous.PriceBasis == datasource.PriceAsTraded && current.PriceBasis == datasource.PriceAsTraded {
+			firstAfterPrevious := sort.Search(len(splitTimes), func(i int) bool {
+				return splitTimes[i].After(previous.Time)
+			})
+			if firstAfterPrevious < len(splitTimes) && !splitTimes[firstAfterPrevious].After(current.Time) {
+				continue
+			}
 		}
 		issues = append(issues, DataQualityIssue{
 			Severity: QualitySeverityWarning,

@@ -132,31 +132,44 @@ func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
 	symbol := fill.Symbol
 
 	// 1. 持仓校验:超卖 = 上游持仓校验漏了的 bug
-	if held := account.PositionQty(fill.Symbol); fill.Qty > held {
+	held := account.PositionQty(symbol)
+	if fill.Qty > held {
 		return account, nil, fmt.Errorf("%w: sell %s %v shares, position only %v",
-			ErrOversell, fill.Symbol, fill.Qty, held)
+			ErrOversell, symbol, fill.Qty, held)
 	}
 
 	// 2. 卖出净收入 = 成交额 − 佣金(卖出佣金从收入扣,与买入佣金摊入成本对称)
 	netProceeds := fill.Qty*fill.Price - fill.Commission
+	cashAfter := account.cash + netProceeds
+	if cashAfter < 0 {
+		return account, nil, fmt.Errorf("%w: sell %s has net proceeds %v, cash only %v",
+			ErrNegativeCash, symbol, netProceeds, account.cash)
+	}
 
 	next := account.clone()
 	queue := next.positions[symbol]
+	closePosition := fill.Qty == held
 
 	var entries []LedgerEntry
-	remaining := fill.Qty // 还需消耗的数量
-	allocatedSum := 0.0   // 已分摊出去的净收入(供末笔吸收浮点残差)
+	var consumed, allocatedSum float64
 
-	for remaining > 0 {
-		lot := queue[0]
-		take := math.Min(remaining, lot.Qty) // 本 lot 被消耗的数量
+	for index, lot := range queue {
+		take := lot.Qty
+		last := index == len(queue)-1
+		// 清仓直接消费每个 lot。部分卖出按 PositionQty 的累加顺序判断 lot 边界，
+		// 避免逐 lot 减法的浮点误差产生尾部碎股。
+		if !closePosition {
+			lotEnd := consumed + lot.Qty
+			last = fill.Qty <= lotEnd
+			if fill.Qty < lotEnd {
+				take = fill.Qty - consumed
+			}
+			consumed = lotEnd
+		}
 
-		// 本 lot 分摊的净收入。
-		// take == remaining 时 take 就是 remaining 本身(浮点完全相等,可安全比较),
-		// 说明这是最后一笔消耗:直接拿"总净收入 − 已分摊",把前面逐笔的
-		// 浮点误差全部吸收掉,保证 Σ分摊 == netProceeds 精确闭合。
+		// 最后一个被消耗的 lot 吸收净收入的分摊残差。
 		var alloc float64
-		if take == remaining {
+		if last {
 			alloc = netProceeds - allocatedSum
 		} else {
 			alloc = netProceeds * take / fill.Qty
@@ -176,14 +189,14 @@ func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
 			LotOpenSeq:  lot.OpenSeq,
 		})
 
-		remaining -= take
-		if take == lot.Qty {
-			queue = queue[1:] // 全部消耗:出队
-		} else {
-			// 部分消耗:剩余部分留在原位(FIFO 顺序不变),
-			// 数量减少,其余字段(成本/建仓时间/序号)不动
-			lot.Qty -= take
-			queue[0] = lot
+		if last {
+			if take < lot.Qty {
+				queue[index].Qty -= take
+			} else {
+				index++
+			}
+			queue = queue[index:]
+			break
 		}
 	}
 
@@ -194,8 +207,8 @@ func applySell(account Account, fill Fill) (Account, []LedgerEntry, error) {
 		next.positions[symbol] = queue
 	}
 
-	// 4. 加现金(卖出是进钱,不可能变负,无需校验)
-	next.cash += netProceeds
+	// 4. 记入已校验的现金余额。
+	next.cash = cashAfter
 
 	// 5. 记账:同一事件的所有条目 CashAfter 统一填事件后现金;
 	//    REALIZED 在前,一条合计的 TRADE 收尾

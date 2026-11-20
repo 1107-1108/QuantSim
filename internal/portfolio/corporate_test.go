@@ -106,6 +106,66 @@ func TestApplyCorporateActionPreservesReverseSplitFractions(t *testing.T) {
 	}
 }
 
+func TestApplyFillClosesFractionalLotsAfterReverseSplit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		firstQty  float64
+		secondQty float64
+		wantQty   [2]float64
+		wantPnL   [2]float64
+		wantCash  float64
+	}{
+		{name: "rounded down", firstQty: 2, secondQty: 3, wantQty: [2]float64{0.2, 0.30000000000000004}, wantPnL: [2]float64{38.8, 28.2}, wantCash: 167},
+		{name: "rounded up", firstQty: 1, secondQty: 2, wantQty: [2]float64{0.1, 0.2}, wantPnL: [2]float64{19, 18}, wantCash: 137},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := accountWithHolding(t, 100, tc.firstQty, 10)
+			account, _, err := ApplyFill(account, Fill{Seq: 2, Symbol: "AAPL", Side: SideBuy, Qty: tc.secondQty, Price: 20, Time: testTime1})
+			if err != nil {
+				t.Fatalf("second buy: %v", err)
+			}
+			holding, _, err := ApplyCorporateAction(account, datasource.CorporateAction{
+				Symbol: "AAPL", Type: datasource.ActionReverseSplit, Date: testTime2, SplitRatio: 0.1,
+			})
+			if err != nil {
+				t.Fatalf("reverse split: %v", err)
+			}
+			before := snapshotAccount(holding)
+			qty := holding.PositionQty("AAPL")
+			sale := Fill{Seq: 3, Symbol: "AAPL", Side: SideSell, Qty: qty, Price: 300, Commission: 3, Time: testTime2}
+
+			oversell := sale
+			oversell.Qty = math.Nextafter(qty, math.Inf(1))
+			unchanged, oversellEntries, err := ApplyFill(holding, oversell)
+			if !errors.Is(err, ErrOversell) || oversellEntries != nil || !reflect.DeepEqual(unchanged, before) {
+				t.Fatalf("oversell returned account %+v, ledger %+v and error %v, want unchanged account, nil and ErrOversell", unchanged, oversellEntries, err)
+			}
+
+			next, entries, err := ApplyFill(holding, sale)
+			if err != nil {
+				t.Fatalf("sell full position of %v shares: %v", qty, err)
+			}
+			if !reflect.DeepEqual(holding, before) {
+				t.Error("sell changed the input account")
+			}
+			if _, exists := next.positions["AAPL"]; exists || !almostEqual(next.Cash(), tc.wantCash) {
+				t.Errorf("post-sale lots = %+v, cash = %v, want no lots and %v cash", next.positions["AAPL"], next.Cash(), tc.wantCash)
+			}
+			if len(entries) != 3 {
+				t.Fatalf("ledger entries = %+v, want two lot realizations and one trade", entries)
+			}
+			for i, entry := range entries[:2] {
+				if entry.Type != EntryRealizedPnL || entry.LotOpenSeq != uint64(i+1) || entry.Qty != tc.wantQty[i] || !almostEqual(entry.RealizedPnL, tc.wantPnL[i]) {
+					t.Errorf("realization %d = %+v, want FIFO lot %d, quantity %v and PnL %v", i, entry, i+1, tc.wantQty[i], tc.wantPnL[i])
+				}
+			}
+			if trade := entries[2]; trade.Type != EntryTrade || trade.Qty != qty || trade.Commission != 3 {
+				t.Errorf("trade = %+v, want sale of %v shares with commission of 3", trade, qty)
+			}
+		})
+	}
+}
+
 // TestApplyCorporateActionBooksDividend 验证除息日的持仓数量决定直接入账的现金分红。
 func TestApplyCorporateActionBooksDividend(t *testing.T) {
 	account := accountWithHolding(t, 5_000, 400, 10)

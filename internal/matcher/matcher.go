@@ -42,6 +42,14 @@ func Match(order Order, bar datasource.Bar, cost CostModel) (*portfolio.Fill, Ma
 		return nil, MatchNoFill, nil
 	}
 	price = applySlippage(price, order.Side, cost.SlippageBps)
+	// 触及限价即触发成交。最终成交价受买单上限和卖单下限约束。
+	if order.Type == LimitOrder {
+		if order.Side == portfolio.SideBuy {
+			price = math.Min(price, order.LimitPrice)
+		} else {
+			price = math.Max(price, order.LimitPrice)
+		}
+	}
 	return &portfolio.Fill{
 		OrderID:    order.ID,
 		Symbol:     order.Symbol,
