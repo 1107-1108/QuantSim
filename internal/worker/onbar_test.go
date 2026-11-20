@@ -2,6 +2,7 @@ package worker
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -19,108 +20,60 @@ import (
 const onBarTestSocket = "/tmp/worker.socket"
 const onBarTestTimeout = 3 * time.Second
 
-func TestStartEmptyInput(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		bars []BarMsg
-	}{
-		{name: "nil"},
-		{name: "empty slice", bars: []BarMsg{}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			session, peer, wait := startSessionTest(t, tc.bars)
-			if err := wait(); err != nil {
-				t.Fatalf("Start: %v", err)
-			}
-			assertOnBarPeerClosed(t, peer)
-			if len(session.orderList) != 0 {
-				t.Errorf("empty input produced orders: %+v", session.orderList)
-			}
-		})
-	}
-}
-
 func TestOnBarOK(t *testing.T) {
 	const seq = uint64(1<<64 - 1)
-	session, peer, wait := startOnBarTest(t, onBarTestBar(seq))
+	peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(seq))
 	assertOnBarRequest(t, peer, seq)
 	sendOnBarBytes(t, peer, onBarTestFrame([]byte(fmt.Sprintf(`{"seq":%d,"condition":"OK"}`, seq))))
 
-	if err := wait(); err != nil {
+	orders, err := wait()
+	if err != nil {
 		t.Fatalf("OnBar: %v", err)
 	}
 	assertNoNextBar(t, peer)
-	if len(session.orderList) != 0 {
-		t.Errorf("OK produced orders: %+v", session.orderList)
+	if len(orders) != 0 {
+		t.Errorf("OK produced orders: %+v", orders)
 	}
 }
 
-func TestStartSocketAlreadyExists(t *testing.T) {
-	file, err := os.OpenFile(onBarTestSocket, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.Remove(onBarTestSocket); err != nil {
-			t.Error(err)
-		}
-	})
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
+func TestOnBarReturnsOrders(t *testing.T) {
+	peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(7))
+	assertOnBarRequest(t, peer, 7)
+	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":7,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"BUY","type":"MARKET","qty":2},{"symbol":"MSFT","side":"SELL","type":"LIMIT","qty":3,"limit_price":112.5}]}`)))
 
-	session := &Session{}
-	err = session.Start([]BarMsg{onBarTestBar(7)})
-	if !errors.Is(err, os.ErrExist) {
-		t.Fatalf("Start error = %v, want %v", err, os.ErrExist)
+	orders, err := wait()
+	if err != nil {
+		t.Fatalf("OnBar: %v", err)
 	}
-	if _, err := os.Stat(onBarTestSocket); err != nil {
-		t.Fatalf("Start removed the existing file: %v", err)
+	want := []OrderMsg{
+		{Symbol: "AAPL", Side: "BUY", Type: "MARKET", Qty: 2},
+		{Symbol: "MSFT", Side: "SELL", Type: "LIMIT", Qty: 3, LimitPrice: 112.5},
+	}
+	if !reflect.DeepEqual(orders, want) {
+		t.Errorf("orders = %+v, want %+v", orders, want)
 	}
 }
 
 func TestOnBarWaitsForCompleteResponseFrame(t *testing.T) {
-	_, peer, wait := startOnBarTest(t, onBarTestBar(7))
+	peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(7))
 	assertOnBarRequest(t, peer, 7)
 	frame := onBarTestFrame([]byte(`{"seq":7,"condition":"OK"}`))
 	sendOnBarBytes(t, peer, frame[:2])
 	sendOnBarBytes(t, peer, frame[2:6])
 	sendOnBarBytes(t, peer, frame[6:])
 
-	if err := wait(); err != nil {
+	if _, err := wait(); err != nil {
 		t.Fatalf("OnBar: %v", err)
-	}
-}
-
-func TestStartWaitsForResponsesAndAccumulatesOrders(t *testing.T) {
-	session, peer, wait := startSessionTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8), onBarTestBar(9)})
-	assertOnBarRequest(t, peer, 7)
-	assertNoNextBar(t, peer)
-	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":7,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"BUY","type":"MARKET","qty":2}]}`)))
-
-	assertOnBarRequest(t, peer, 8)
-	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":8,"condition":"OK"}`)))
-
-	assertOnBarRequest(t, peer, 9)
-	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":9,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"SELL","type":"LIMIT","qty":1,"limit_price":112.5},{"symbol":"MSFT","side":"BUY","type":"MARKET","qty":3}]}`)))
-
-	if err := wait(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	assertOnBarPeerClosed(t, peer)
-	want := []OrderMsg{
-		{Symbol: "AAPL", Side: "BUY", Type: "MARKET", Qty: 2},
-		{Symbol: "AAPL", Side: "SELL", Type: "LIMIT", Qty: 1, LimitPrice: 112.5},
-		{Symbol: "MSFT", Side: "BUY", Type: "MARKET", Qty: 3},
-	}
-	if !reflect.DeepEqual(session.orderList, want) {
-		t.Errorf("orders = %+v, want %+v", session.orderList, want)
 	}
 }
 
 func TestOnBarRejectsNilConnection(t *testing.T) {
 	session := &Session{}
-	assertOnBarError(t, session.OnBar(nil, onBarTestBar(7)), "worker connection is nil")
+	orders, err := session.OnBar(t.Context(), nil, onBarTestBar(7))
+	assertOnBarError(t, err, "worker connection is nil")
+	if len(orders) != 0 {
+		t.Errorf("nil connection produced orders: %+v", orders)
+	}
 }
 
 func TestOnBarRejectsInvalidInput(t *testing.T) {
@@ -136,8 +89,9 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bar := onBarTestBar(7)
 			tc.invalidate(&bar)
-			session, _, wait := startOnBarTest(t, bar)
-			if err := wait(); tc.want != "" {
+			_, wait := startOnBarTest(t, t.Context(), bar)
+			orders, err := wait()
+			if tc.want != "" {
 				assertOnBarError(t, err, tc.want)
 			} else {
 				var unsupported *json.UnsupportedValueError
@@ -145,8 +99,8 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 					t.Fatalf("OnBar error = %v, want *json.UnsupportedValueError", err)
 				}
 			}
-			if len(session.orderList) != 0 {
-				t.Errorf("invalid input produced orders: %+v", session.orderList)
+			if len(orders) != 0 {
+				t.Errorf("invalid input produced orders: %+v", orders)
 			}
 		})
 	}
@@ -155,12 +109,13 @@ func TestOnBarRejectsInvalidInput(t *testing.T) {
 func TestOnBarRejectsOversizedRequest(t *testing.T) {
 	bar := onBarTestBar(7)
 	bar.Symbol = strings.Repeat("A", 16<<20)
-	_, _, wait := startOnBarTest(t, bar)
-	assertOnBarError(t, wait(), "exceeds")
+	_, wait := startOnBarTest(t, t.Context(), bar)
+	_, err := wait()
+	assertOnBarError(t, err, "exceeds")
 }
 
 func TestOnBarReturnsWriteError(t *testing.T) {
-	_, peer, wait := startOnBarTest(t, onBarTestBar(7))
+	peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(7))
 	var header [4]byte
 	if _, err := io.ReadFull(peer, header[:]); err != nil {
 		t.Fatalf("read request header: %v", err)
@@ -168,7 +123,8 @@ func TestOnBarReturnsWriteError(t *testing.T) {
 	if err := peer.Close(); err != nil {
 		t.Fatalf("close peer: %v", err)
 	}
-	assertOnBarError(t, wait(), "write frame")
+	_, err := wait()
+	assertOnBarError(t, err, "write frame")
 }
 
 func TestOnBarRejectsInvalidResponseFrames(t *testing.T) {
@@ -185,7 +141,7 @@ func TestOnBarRejectsInvalidResponseFrames(t *testing.T) {
 		{name: "oversized length", frame: []byte{1, 0, 0, 1}, want: "invalid frame length"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session, peer, wait := startOnBarTest(t, onBarTestBar(7))
+			peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(7))
 			assertOnBarRequest(t, peer, 7)
 			if len(tc.frame) > 0 {
 				sendOnBarBytes(t, peer, tc.frame)
@@ -194,13 +150,13 @@ func TestOnBarRejectsInvalidResponseFrames(t *testing.T) {
 				t.Fatalf("close response stream: %v", err)
 			}
 
-			err := wait()
+			orders, err := wait()
 			assertOnBarError(t, err, tc.want)
 			if tc.cause != nil && !errors.Is(err, tc.cause) {
 				t.Errorf("OnBar error = %v, want wrapped %v", err, tc.cause)
 			}
-			if len(session.orderList) != 0 {
-				t.Errorf("invalid frame produced orders: %+v", session.orderList)
+			if len(orders) != 0 {
+				t.Errorf("invalid frame produced orders: %+v", orders)
 			}
 		})
 	}
@@ -226,33 +182,62 @@ func TestOnBarRejectsInvalidResponses(t *testing.T) {
 		{name: "empty orders", payload: `{"seq":7,"condition":"ORDER","orderBatch":[]}`, want: "ORDER response contains no orders"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session, peer, wait := startOnBarTest(t, onBarTestBar(7))
+			peer, wait := startOnBarTest(t, t.Context(), onBarTestBar(7))
 			assertOnBarRequest(t, peer, 7)
 			sendOnBarBytes(t, peer, onBarTestFrame([]byte(tc.payload)))
-			assertOnBarError(t, wait(), tc.want)
-			if len(session.orderList) != 0 {
-				t.Errorf("invalid response produced orders: %+v", session.orderList)
+			orders, err := wait()
+			assertOnBarError(t, err, tc.want)
+			if len(orders) != 0 {
+				t.Errorf("invalid response produced orders: %+v", orders)
 			}
 		})
 	}
 }
 
-func TestStartStopsAfterLaterError(t *testing.T) {
-	session, peer, wait := startSessionTest(t, []BarMsg{onBarTestBar(7), onBarTestBar(8), onBarTestBar(9)})
-	assertOnBarRequest(t, peer, 7)
-	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":7,"condition":"ORDER","orderBatch":[{"symbol":"AAPL","side":"BUY","type":"MARKET","qty":2}]}`)))
-	assertOnBarRequest(t, peer, 8)
-	sendOnBarBytes(t, peer, onBarTestFrame([]byte(`{"seq":8,"condition":"ERROR"}`)))
+func TestOnBarHonorsContext(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		readBar    bool
+		cancelRead bool
+	}{
+		{name: "blocked write"},
+		{name: "no response", readBar: true},
+		{name: "canceled while waiting for response", readBar: true, cancelRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if tc.cancelRead {
+				ctx, cancel = context.WithCancel(t.Context())
+			} else {
+				ctx, cancel = context.WithTimeout(t.Context(), 250*time.Millisecond)
+			}
+			defer cancel()
 
-	assertOnBarError(t, wait(), "worker error at sequence 8")
-	assertOnBarPeerClosed(t, peer)
-	want := []OrderMsg{{Symbol: "AAPL", Side: "BUY", Type: "MARKET", Qty: 2}}
-	if !reflect.DeepEqual(session.orderList, want) {
-		t.Errorf("orders after later error = %+v, want %+v", session.orderList, want)
+			peer, wait := startOnBarTest(t, ctx, onBarTestBar(7))
+			if tc.readBar {
+				assertOnBarRequest(t, peer, 7)
+			}
+			if tc.cancelRead {
+				cancel()
+			}
+
+			orders, err := wait()
+			if tc.cancelRead {
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("OnBar error = %v, want context.Canceled", err)
+				}
+			} else if !isWorkerTimeout(err) {
+				t.Errorf("OnBar error = %v, want a timeout", err)
+			}
+			if len(orders) != 0 {
+				t.Errorf("OnBar returned orders without a response: %+v", orders)
+			}
+		})
 	}
 }
 
-func startOnBarTest(t *testing.T, bar BarMsg) (*Session, net.Conn, func() error) {
+func startOnBarTest(t *testing.T, ctx context.Context, bar BarMsg) (net.Conn, func() ([]OrderMsg, error)) {
 	t.Helper()
 	conn, peer := net.Pipe()
 	t.Cleanup(func() {
@@ -263,84 +248,28 @@ func startOnBarTest(t *testing.T, bar BarMsg) (*Session, net.Conn, func() error)
 		t.Fatal(err)
 	}
 
+	type result struct {
+		orders []OrderMsg
+		err    error
+	}
+
 	session := &Session{}
-	result := make(chan error, 1)
+	done := make(chan result, 1)
 	go func() {
-		result <- session.OnBar(conn, bar)
+		orders, err := session.OnBar(ctx, conn, bar)
+		done <- result{orders: orders, err: err}
 	}()
-	wait := func() error {
+	wait := func() ([]OrderMsg, error) {
 		t.Helper()
 		select {
-		case err := <-result:
-			return err
+		case result := <-done:
+			return result.orders, result.err
 		case <-time.After(onBarTestTimeout):
 			t.Fatal("OnBar did not return")
-			return nil
+			return nil, nil
 		}
 	}
-	return session, peer, wait
-}
-
-func startSessionTest(t *testing.T, bars []BarMsg) (*Session, *net.UnixConn, func() error) {
-	t.Helper()
-	// Start binds a fixed socket path. Keep these tests serial and preserve any existing socket.
-	if _, err := os.Lstat(onBarTestSocket); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("need an unused %s (stat error: %v)", onBarTestSocket, err)
-	}
-
-	session := &Session{}
-	finished := make(chan struct{})
-	var runErr error
-	go func() {
-		runErr = session.Start(bars)
-		close(finished)
-	}()
-
-	deadline := time.NewTimer(onBarTestTimeout)
-	defer deadline.Stop()
-	retry := time.NewTicker(5 * time.Millisecond)
-	defer retry.Stop()
-	addr := &net.UnixAddr{Name: onBarTestSocket, Net: "unix"}
-	var peer *net.UnixConn
-	for {
-		conn, err := net.DialUnix("unix", nil, addr)
-		if err == nil {
-			peer = conn
-			break
-		}
-		select {
-		case <-finished:
-			t.Fatalf("Start exited before worker connected: %v", runErr)
-		case <-deadline.C:
-			t.Fatalf("timed out connecting the test worker to Start: %v", err)
-		case <-retry.C:
-		}
-	}
-	wait := func() error {
-		t.Helper()
-		select {
-		case <-finished:
-			return runErr
-		case <-time.After(onBarTestTimeout):
-			t.Fatal("Start did not return")
-			return nil
-		}
-	}
-	t.Cleanup(func() {
-		_ = peer.Close()
-		select {
-		case <-finished:
-			if _, err := os.Lstat(onBarTestSocket); !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("listener socket still present after Start (stat error: %v)", err)
-			}
-		case <-time.After(onBarTestTimeout):
-			t.Error("Start did not return after disconnecting the test worker")
-		}
-	})
-	if err := peer.SetDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
-		t.Fatalf("set worker deadline: %v", err)
-	}
-	return session, peer, wait
+	return peer, wait
 }
 
 func onBarTestBar(seq uint64) BarMsg {
@@ -412,14 +341,6 @@ func assertNoNextBar(t *testing.T, peer net.Conn) {
 	}
 	if err := peer.SetReadDeadline(time.Now().Add(onBarTestTimeout)); err != nil {
 		t.Fatalf("reset read deadline: %v", err)
-	}
-}
-
-func assertOnBarPeerClosed(t *testing.T, peer io.Reader) {
-	t.Helper()
-	var unexpected [1]byte
-	if n, err := peer.Read(unexpected[:]); n != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("expected connection to close without sending another bar, read %d bytes with %v", n, err)
 	}
 }
 

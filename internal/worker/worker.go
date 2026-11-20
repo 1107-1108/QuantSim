@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -8,14 +9,25 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
 )
 
 // maxFrameSize 是单帧上限 16 MiB
 // 帧格式:4 字节无符号大端长度头 + length 字节 UTF-8 JSON 负载。
 const maxFrameSize = 16 << 20
+const defaultConnectTimeout = 5 * time.Second
+const defaultBarTimeout = 5 * time.Second
+const workerExitTimeout = time.Second
 
 // Session 与每个Worker的通讯
 type Session struct {
+	PythonPath     string        // 为空时使用 python3
+	ScriptPath     string        // 为空时向上查找 python-worker/main.py
+	ConnectTimeout time.Duration // 0 使用默认值
+	BarTimeout     time.Duration // 0 使用默认值
+
 	socket    net.Listener
 	orderList []OrderMsg
 }
@@ -42,65 +54,195 @@ func (s *Session) CreateListener(sockName string) error {
 	return nil
 }
 
-// Start 等待 Python Worker 连接，再逐帧发送 Bar。
-func (s *Session) Start(msgs []BarMsg) error {
+// Start 启动 Python Worker，等待连接后逐帧发送 Bar。
+func (s *Session) Start(ctx context.Context, msgs []BarMsg) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	python := s.PythonPath
+	if python == "" {
+		python = "python3"
+	}
+	script, err := workerScriptPath(s.ScriptPath)
+	if err != nil {
+		return err
+	}
+	connectTimeout := s.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = defaultConnectTimeout
+	}
+	barTimeout := s.BarTimeout
+	if barTimeout <= 0 {
+		barTimeout = defaultBarTimeout
+	}
+
 	// 创建 Socket Listener
 	if err := s.CreateListener("worker.socket"); err != nil {
 		return err
 	}
-	defer s.socket.Close()
+	listener := s.socket
+	defer listener.Close()
 
-	// 等待唯一的 Python Worker 连接
-	conn, err := s.socket.Accept()
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	defer stopWorker()
+	cmd := exec.CommandContext(workerCtx, python, script, "--socket", listener.Addr().String())
+	cmd.Dir = filepath.Dir(script)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start Python worker: %w", err)
+	}
+
+	workerDone := make(chan struct{})
+	var workerErr error
+	go func() {
+		workerErr = cmd.Wait()
+		close(workerDone)
+		// Python 提前退出时，让仍在等待连接的 Accept 返回。
+		listener.Close()
+	}()
+	defer func() {
+		stopWorker()
+		<-workerDone
+	}()
+
+	connectCtx, cancelConnect := context.WithTimeout(ctx, connectTimeout)
+	stopAccept := context.AfterFunc(connectCtx, func() { listener.Close() })
+	conn, err := listener.Accept()
+	stopAccept()
+	connectErr := connectCtx.Err()
+	cancelConnect()
 	if err != nil {
-		return err
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if connectErr != nil {
+			return fmt.Errorf("wait for Python worker connection: %w", connectErr)
+		}
+		select {
+		case <-workerDone:
+			if workerErr != nil {
+				return fmt.Errorf("Python worker exited before connecting: %w", workerErr)
+			}
+			return fmt.Errorf("Python worker exited before connecting")
+		default:
+			return fmt.Errorf("accept Python worker connection: %w", err)
+		}
 	}
 	defer conn.Close()
 
 	// 逐帧发送 Bar
 	for _, msg := range msgs {
-		if err := s.OnBar(conn, msg); err != nil {
-			return err
+		barCtx, cancelBar := context.WithTimeout(ctx, barTimeout)
+		orders, err := s.OnBar(barCtx, conn, msg)
+		cancelBar()
+		if err != nil {
+			return fmt.Errorf("bar seq %d: %w", msg.Seq, err)
 		}
+		s.orderList = append(s.orderList, orders...)
 	}
 
-	return nil
+	// 关闭连接后，Python 收到 EOF 并退出。
+	conn.Close()
+	timer := time.NewTimer(workerExitTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-workerDone:
+		if workerErr != nil {
+			return fmt.Errorf("wait for Python worker exit: %w", workerErr)
+		}
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("wait for Python worker exit: %w", context.DeadlineExceeded)
+	}
 }
 
-// OnBar 往 Python 推送一根 Bar，并等待这一帧的响应。
-func (s *Session) OnBar(conn net.Conn, msg BarMsg) error {
+func workerScriptPath(script string) (string, error) {
+	if script != "" {
+		return filepath.Abs(script)
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		path := filepath.Join(dir, "python-worker", "main.py")
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+			return path, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("python-worker/main.py not found; set Session.ScriptPath")
+		}
+		dir = parent
+	}
+}
+
+// OnBar 往 Python 推送一根 Bar，并返回这一帧产生的订单。
+func (s *Session) OnBar(ctx context.Context, conn net.Conn, msg BarMsg) (orders []OrderMsg, err error) {
 	if conn == nil {
-		return fmt.Errorf("worker connection is nil")
+		return nil, fmt.Errorf("worker connection is nil")
 	}
 	if msg.Seq == 0 {
-		return fmt.Errorf("sequence number cannot be 0")
+		return nil, fmt.Errorf("sequence number cannot be 0")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+	if ctx.Done() != nil {
+		interrupted := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			conn.SetDeadline(time.Now())
+			close(interrupted)
+		})
+		defer func() {
+			if !stop() {
+				<-interrupted
+				hasDeadline = true
+			}
+			if hasDeadline {
+				conn.SetDeadline(time.Time{})
+			}
+			if err != nil && ctx.Err() != nil {
+				err = ctx.Err()
+			}
+		}()
 	}
 
 	// 序列化 BarMsg
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// 发送当前 Bar
 	if err := writeFrame(conn, data); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 等待 Python Worker 返回确认
 	response, err := readFrame(conn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var workerResponse WorkerResponse
 	if err := json.Unmarshal(response, &workerResponse); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 验证 Sequence
 	if workerResponse.Seq != msg.Seq {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"sequence mismatch: expected %d, got %d",
 			msg.Seq, workerResponse.Seq,
 		)
@@ -109,35 +251,26 @@ func (s *Session) OnBar(conn net.Conn, msg BarMsg) error {
 	switch workerResponse.Condition {
 	case "OK":
 		// Python 处理完成，没有交易信号
-		return nil
+		return nil, nil
 
 	case "ORDER":
 		if len(workerResponse.OrderBatch) == 0 {
-			return fmt.Errorf("ORDER response contains no orders")
+			return nil, fmt.Errorf("ORDER response contains no orders")
 		}
-
-		// 把订单加入 Session
-		s.orderList = append(
-			s.orderList,
-			workerResponse.OrderBatch...,
-		)
-
-		// TODO: 将订单交给 Matcher 处理
+		return workerResponse.OrderBatch, nil
 
 	case "ERROR":
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"worker error at sequence %d",
 			workerResponse.Seq,
 		)
 
 	default:
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"unknown worker condition: %s",
 			workerResponse.Condition,
 		)
 	}
-
-	return nil
 }
 
 // writeFrame 完整写出一帧;长度超上限是协议错误,在写之前拒绝。
