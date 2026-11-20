@@ -102,6 +102,50 @@ class Strategy:
 	}
 }
 
+func TestStartRejectsNonIncreasingBarSequences(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seq  uint64
+	}{
+		{name: "duplicate", seq: 9},
+		{name: "decreasing", seq: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := useTestPythonWorker(t, `
+class Strategy:
+    def on_bar(self, bar):
+        with open("seen.txt", "a", encoding="ascii") as file:
+            print(bar["seq"], file=file)
+        return []
+`)
+			bars := []BarMsg{onBarTestBar(7), onBarTestBar(9), onBarTestBar(tc.seq), onBarTestBar(10)}
+			err := runTestPythonWorker(t, session, bars, onBarTestTimeout)
+			assertOnBarError(t, err, "worker error at sequence "+strconv.FormatUint(tc.seq, 10))
+			seen, err := os.ReadFile(filepath.Join(filepath.Dir(session.ScriptPath), "seen.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(seen) != "7\n9\n" {
+				t.Errorf("strategy saw sequences %q, want %q", seen, "7\n9\n")
+			}
+		})
+	}
+}
+
+func TestStartReportsOversizedOrderBatchAsWorkerError(t *testing.T) {
+	session := useTestPythonWorker(t, `
+class Strategy:
+    def on_bar(self, bar):
+        order = {"symbol": bar["symbol"], "side": "BUY", "type": "MARKET", "qty": 1}
+        return [order] * 350_000  # The encoded batch exceeds 16 MiB.
+`)
+	err := runTestPythonWorker(t, session, []BarMsg{onBarTestBar(7)}, onBarTestTimeout)
+	assertOnBarError(t, err, "worker error at sequence 7")
+	if len(session.orderList) != 0 {
+		t.Errorf("collected %d orders from an oversized batch", len(session.orderList))
+	}
+}
+
 func TestStartReturnsPythonExitBeforeConnect(t *testing.T) {
 	session := useTestPythonWorker(t, "raise SystemExit(7)")
 	err := runTestPythonWorker(t, session, []BarMsg{onBarTestBar(7)}, onBarTestTimeout)
