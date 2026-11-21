@@ -38,5 +38,7 @@ Thanks a lot for Ashley's Mental and Coffee Support!
 - **Frontend**: React
 - **Communication:** RPC between the Go backend and Python worker
 
+See the [Python strategy guide](python-worker/README.md) for the `on_bar` contract and examples.
+
 ## Disclaimer
-This project is for educational and personal research purposes only. It does not provide investment advice and should not be used for live trading without independent validation.
+This project is for educational and personal research purposes only. It does not provide investment advice and should not be used for live trading without independent validation. 
