@@ -56,10 +56,31 @@ func (s *Session) CreateListener(sockName string) error {
 	return nil
 }
 
-// Start 启动 Python Worker，等待连接后逐帧发送 Bar。同一 Session 一次只能运行一个 Worker。
+// Start 启动 Python worker，依次发送预先准备好的行情消息并收集订单。
 func (s *Session) Start(ctx context.Context, msgs []BarMsg) error {
+	return s.WithWorker(ctx, func(sendBar SendBar) error {
+		for _, msg := range msgs {
+			orders, err := sendBar(msg)
+			if err != nil {
+				return err
+			}
+			s.orderList = append(s.orderList, orders...)
+		}
+		return nil
+	})
+}
+
+// SendBar 同步发送一根 bar，等待 Python 返回本根策略订单。
+type SendBar func(BarMsg) ([]OrderMsg, error)
+
+// WithWorker 启动一个 Python worker，在连接建立后调用 run，并在退出时回收进程和连接。
+// run 必须在返回前串行调用 sendBar。同一 Session 一次只能运行一个 worker。
+func (s *Session) WithWorker(ctx context.Context, run func(sendBar SendBar) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if run == nil {
+		return fmt.Errorf("worker session requires a callback")
 	}
 	if !s.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("worker session is already running")
@@ -143,15 +164,18 @@ func (s *Session) Start(ctx context.Context, msgs []BarMsg) error {
 	}
 	defer conn.Close()
 
-	// 逐帧发送 Bar
-	for _, msg := range msgs {
+	// 回测循环可以等撮合完成后，再用实时生成的账户快照发出这一帧。
+	sendBar := func(msg BarMsg) ([]OrderMsg, error) {
 		barCtx, cancelBar := context.WithTimeout(ctx, barTimeout)
+		defer cancelBar()
 		orders, err := s.OnBar(barCtx, conn, msg)
-		cancelBar()
 		if err != nil {
-			return fmt.Errorf("bar seq %d: %w", msg.Seq, err)
+			return nil, fmt.Errorf("bar seq %d: %w", msg.Seq, err)
 		}
-		s.orderList = append(s.orderList, orders...)
+		return orders, nil
+	}
+	if err := run(sendBar); err != nil {
+		return err
 	}
 
 	// 关闭连接后，Python 收到 EOF 并退出。

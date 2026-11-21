@@ -3,7 +3,7 @@ package worker
 // Go ↔ Python worker 的线上契约消息。
 //
 // 契约要点(详见 docs/design/DESIGN-DETAIL.md):
-//   - o/h/l/c/v 均为策略口径(复权后),复权在推送前由 Go 完成,消息不含 AdjClose
+//   - o/h/l/c/v 由 Go 调用方按策略使用的价格口径填入，传输层直接发送这些值
 //   - 账户快照随每根 BarMsg 下发,worker 查持仓 = 读本地缓存,无反向 RPC
 //   - 字段短键名(seq/o/h/l/c/v)是契约的一部分,Python 端按这些键解析,不得改名
 //
@@ -14,7 +14,7 @@ type BarMsg struct {
 	Seq     uint64          `json:"seq"`    // 严格递增序号;worker 按序分发,paper 会话断点续传的锚点, 非0
 	Symbol  string          `json:"symbol"` // 内部 Bar 不带 symbol(存储按 symbol 分区),线上多标的混流必须带
 	Ts      int64           `json:"ts"`     // bar 时间,epoch 毫秒(UTC)
-	Open    float64         `json:"o"`      // 以下五个字段均为复权后策略口径
+	Open    float64         `json:"o"`      // 以下五个字段是本根 bar 的行情
 	High    float64         `json:"h"`
 	Low     float64         `json:"l"`
 	Close   float64         `json:"c"`

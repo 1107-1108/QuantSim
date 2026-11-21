@@ -2,11 +2,16 @@ from typing import Any
 
 
 class Strategy:
-    def on_bar(self, bar: dict[str, Any]) -> list[dict[str, Any]]:
-        """根据当前 bar 和账户快照返回订单。
+    def __init__(self) -> None:
+        self.submitted = False
 
-        收盘价是 bar["c"]，现金和持仓在 bar["account"] 里。
-        每笔订单包含 symbol、side、type 和 qty，限价单另加 limit_price。
-        返回空列表表示这一根 bar 没有订单。
-        """
-        return []
+    def on_bar(self, bar: dict[str, Any]) -> list[dict[str, Any]]:
+        """首次收到 AAPL 或 MSFT 行情时各买 100 股，之后一直持有。"""
+        if self.submitted or bar["symbol"] not in ("AAPL", "MSFT"):
+            return []
+
+        self.submitted = True
+        return [
+            {"symbol": "AAPL", "side": "BUY", "type": "MARKET", "qty": 100},
+            {"symbol": "MSFT", "side": "BUY", "type": "MARKET", "qty": 1000},
+        ]

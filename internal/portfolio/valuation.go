@@ -3,14 +3,13 @@ package portfolio
 import (
 	"fmt"
 	"math"
-	"slices"
 )
 
 // Equity 账户净值 = 现金 + Σ(持仓数量 × 市价)
 // 持仓标的缺 mark → ErrMissingMark;数量为 0 的持仓跳过,不要求 mark
 func (account *Account) Equity(marks map[string]float64) (float64, error) {
 	total := account.cash
-	for symbol := range account.positions {
+	for _, symbol := range account.PositionSymbols() {
 		qty := account.PositionQty(symbol)
 		if qty == 0 {
 			continue
@@ -71,13 +70,7 @@ type AccountView struct {
 func (account *Account) AccountView(marks map[string]float64) (AccountView, error) {
 	view := AccountView{Cash: account.cash, Equity: account.cash}
 
-	symbols := make([]string, 0, len(account.positions))
-	for symbol := range account.positions {
-		symbols = append(symbols, symbol)
-	}
-	slices.Sort(symbols)
-
-	for _, symbol := range symbols {
+	for _, symbol := range account.PositionSymbols() {
 		qty := account.PositionQty(symbol)
 		if qty == 0 {
 			continue

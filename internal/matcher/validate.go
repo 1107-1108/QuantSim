@@ -8,9 +8,8 @@ import (
 	"FinanceSimulator/portfolio"
 )
 
-// validateOrder 订单边界校验。matcher 的订单来自不可信的上游(Python 策略),
-// 任何字段非法都 fail fast——放行会产生一笔把账记坏的 Fill。
-func validateOrder(order Order) error {
+// ValidateOrder 检查订单字段，供接单和撮合阶段共用。
+func ValidateOrder(order Order) error {
 	switch {
 	case order.Symbol == "":
 		return fmt.Errorf("%w: empty symbol", ErrInvalidOrder)
@@ -26,9 +25,9 @@ func validateOrder(order Order) error {
 	return nil
 }
 
-// validateBar 行情边界校验。只查撮合实际用到的 OHL 三个价
+// ValidateBar 行情边界校验。只查撮合价格口径及实际用到的 OHL 三个价
 // (OHLC 一致性、缺口等数据质量规则是 datasource 校验器的职责,不在此重复)。
-func validateBar(bar datasource.Bar) error {
+func ValidateBar(bar datasource.Bar) error {
 	if bar.PriceBasis == datasource.PriceSplitAdjusted {
 		return fmt.Errorf("%w: convert split-adjusted OHLC to as-traded prices before matching", ErrInvalidBar)
 	}

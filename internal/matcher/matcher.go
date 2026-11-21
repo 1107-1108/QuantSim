@@ -31,10 +31,10 @@ type CostModel struct {
 // matcher 不知道 T/T+1:订单该在哪根 bar 撮合是事件循环的选择。
 // Fill.Seq 不由本函数赋值:成交序号由事件循环全局递增分配,保证回放确定性。
 func Match(order Order, bar datasource.Bar, cost CostModel) (*portfolio.Fill, MatchStatus, error) {
-	if err := validateOrder(order); err != nil {
+	if err := ValidateOrder(order); err != nil {
 		return nil, "", err
 	}
-	if err := validateBar(bar); err != nil {
+	if err := ValidateBar(bar); err != nil {
 		return nil, "", err
 	}
 	price, ok := basePrice(order, bar)

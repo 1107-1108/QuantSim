@@ -36,6 +36,23 @@ func (account *Account) InitialCash() float64 {
 	return account.initialCash
 }
 
+// PositionSymbols 返回当前有持仓的标的，按标的排序。
+func (account *Account) PositionSymbols() []string {
+	symbols := make([]string, 0, len(account.positions))
+	for symbol, lots := range account.positions {
+		if len(lots) > 0 {
+			symbols = append(symbols, symbol)
+		}
+	}
+	slices.Sort(symbols)
+	return symbols
+}
+
+// OpenLots 返回指定标的的持仓批次副本。
+func (account *Account) OpenLots(symbol string) []Lot {
+	return slices.Clone(account.positions[symbol])
+}
+
 // PositionQty 返回一个标的全部未平仓 lot 的数量之和。
 func (account *Account) PositionQty(symbol string) float64 {
 	var total float64
